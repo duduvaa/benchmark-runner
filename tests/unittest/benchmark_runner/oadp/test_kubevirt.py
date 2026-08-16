@@ -21,6 +21,7 @@ from benchmark_runner.oadp.constants import (
     VM_POPULATION_METHOD_SCRIPT,
 )
 from benchmark_runner.oadp.dataset import OadpDatasetMixin
+from benchmark_runner.oadp.execution import OadpExecutionMixin
 from benchmark_runner.oadp.scenario import OadpScenarioMixin, scenario_includes_kubevirt_dataset
 from benchmark_runner.oadp.vm_operations import OadpVmOperationsMixin
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
@@ -157,6 +158,10 @@ class TestableVmValidation(OadpVmValidationMixin, OadpVmOperationsMixin, OadpWor
 
 class TestableDataset(OadpDatasetMixin, OadpVmOperationsMixin, OadpWorkloads):
     __test__ = False
+
+
+class TestableExecution(OadpExecutionMixin, OadpWorkloads):
+    pass
 
 
 class TestableIncrementalData(
@@ -788,6 +793,59 @@ class TestValidateVmDatasetExistenceChecks:
         scenario = _kubevirt_scenario()
         result = mx._validate_vm_dataset(scenario, self._ds())
         assert result is False
+
+
+class TestVmExistenceCheckRetryLogic:
+    """Regression tests for ticket 006 live-test finding: post-restore VM checks must
+    retry using the configured retry_logic instead of failing on the very first check,
+    since VMs legitimately take time to come back up after a restore completes."""
+
+    @pytest.fixture
+    def mx(self):
+        return TestableVmValidation()
+
+    def test_check_vm_count_retries_until_success(self, mx):
+        mx.set_validation_retry_logic(interval_between_checks=0, max_attempts=3)
+        # First two attempts report only 1/2 VMs, third attempt reports 2/2
+        mx._oc.run.side_effect = ["1", "1", "2"]
+        assert mx._check_vm_count("ns1", 2) is True
+        assert mx._oc.run.call_count == 3
+
+    def test_check_all_vmis_running_retries_until_success(self, mx):
+        mx.set_validation_retry_logic(interval_between_checks=0, max_attempts=3)
+        mx._oc.run.side_effect = ["1", "2"]
+        assert mx._check_all_vmis_running("ns1", 2) is True
+        assert mx._oc.run.call_count == 2
+
+    def test_check_vm_count_fails_after_exhausting_attempts(self, mx):
+        mx.set_validation_retry_logic(interval_between_checks=0, max_attempts=3)
+        mx._oc.run.return_value = "0"
+        assert mx._check_vm_count("ns1", 2) is False
+        assert mx._oc.run.call_count == 3
+
+    def test_check_defaults_to_single_attempt_when_retry_logic_unset(self, mx):
+        """Without any prior set_validation_retry_logic() call, behave as a single check."""
+        del mx._OadpWorkloads__retry_logic
+        mx._oc.run.return_value = "1"
+        assert mx._check_vm_count("ns1", 2) is False
+        assert mx._oc.run.call_count == 1
+
+    def test_validate_restored_vm_datasets_tolerates_transient_vm_restart(self, mx):
+        """End-to-end: validate_restored_vm_datasets() sets interval=15/max_attempts=28,
+        and the VM count/running checks should use those settings to ride out a VM that
+        is still restarting right after the restore CR reports Completed."""
+        mx.get_dataset_validation_mode = lambda ds: "none"
+        # VM count check: 1/2, then 2/2. VMI running check: 1/2, then 2/2.
+        mx._oc.run.side_effect = ["1", "2", "1", "2"]
+        scenario = _kubevirt_scenario()
+        scenario["dataset"]["namespace"] = "ns1"
+        scenario["dataset"]["vms_per_namespace"] = 2
+
+        with patch("time.sleep"):
+            result = mx.validate_restored_vm_datasets(scenario)
+
+        assert result is True
+        assert mx._oc.run.call_count == 4
 
 
 class TestConstants:
@@ -1479,3 +1537,73 @@ class TestScriptBasedScenariosFromTestsYaml:
             "backup-kubevirt-script-2vm-2data-cephrbd",
         }
         assert len(names) == 5
+
+
+# ===========================================================================
+# 25. exec_backup plugin -> CLI flag dispatch (ticket 006 live-test finding)
+#
+# A live Tier-1 test against a real cluster found that plugin: kubevirt
+# backups fell through to the bare "else" branch (no datamover flags),
+# producing snapshotMoveData: false and zero DataUpload CRs — i.e. only a
+# CSI snapshot, with VM disk data never actually copied into the BSL.
+# kubevirt must be routed the same way as vbd: --data-mover 'velero'
+# --snapshot-move-data=true.
+# ===========================================================================
+
+
+class TestExecBackupPluginFlags:
+    @pytest.fixture
+    def mx(self):
+        m = TestableExecution()
+        # Stub default test_env["source"] is "upstream"; downstream tests override it.
+        m._OadpWorkloads__test_env["source"] = "downstream"
+        m._OadpWorkloads__ssh.run.return_value = 'Backup request "b1" submitted successfully.'
+        return m
+
+    def test_downstream_kubevirt_gets_datamover_flags(self, mx):
+        mx.exec_backup(plugin="kubevirt", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--data-mover 'velero'" in cmd
+        assert "--snapshot-move-data=true" in cmd
+
+    def test_downstream_vbd_still_gets_datamover_flags(self, mx):
+        mx.exec_backup(plugin="vbd", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--data-mover 'velero'" not in cmd  # downstream vbd path omits --data-mover
+        assert "--snapshot-move-data=true" in cmd
+
+    def test_downstream_csi_gets_no_datamover_flags(self, mx):
+        mx.exec_backup(plugin="csi", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--snapshot-move-data" not in cmd
+        assert "--data-mover" not in cmd
+
+    def test_downstream_kopia_gets_fs_backup_flags(self, mx):
+        mx.exec_backup(plugin="kopia", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--default-volumes-to-fs-backup=true" in cmd
+        assert "--snapshot-volumes=false" in cmd
+
+    def test_upstream_kubevirt_gets_datamover_flags(self, mx):
+        mx._OadpWorkloads__test_env["source"] = "upstream"
+        mx._OadpWorkloads__test_env["velero_cli_path"] = "/tmp/velero-1-12"
+        mx.exec_backup(plugin="kubevirt", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--data-mover 'velero'" in cmd
+        assert "--snapshot-move-data=true" in cmd
+
+    def test_upstream_vbd_gets_datamover_flags(self, mx):
+        mx._OadpWorkloads__test_env["source"] = "upstream"
+        mx._OadpWorkloads__test_env["velero_cli_path"] = "/tmp/velero-1-12"
+        mx.exec_backup(plugin="vbd", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--data-mover 'velero'" in cmd
+        assert "--snapshot-move-data=true" in cmd
+
+    def test_upstream_csi_gets_no_datamover_flags(self, mx):
+        mx._OadpWorkloads__test_env["source"] = "upstream"
+        mx._OadpWorkloads__test_env["velero_cli_path"] = "/tmp/velero-1-12"
+        mx.exec_backup(plugin="csi", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--snapshot-move-data" not in cmd
+        assert "--data-mover" not in cmd

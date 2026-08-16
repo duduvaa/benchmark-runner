@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
 from benchmark_runner.oadp.constants import (
@@ -186,27 +187,67 @@ class OadpVmValidationMixin:
     # Individual checks
     # ------------------------------------------------------------------
 
+    def _get_retry_logic(self) -> dict:
+        """Read retry settings set via ``set_validation_retry_logic``, with safe defaults."""
+        return getattr(self, "_OadpWorkloads__retry_logic", None) or {
+            "interval_between_checks": 5,
+            "max_attempts": 1,
+        }
+
     def _check_vm_count(self, namespace: str, expected: int) -> bool:
-        result = self._oc.run(cmd=f"oc get vm -n {namespace} --no-headers 2>/dev/null | wc -l")
-        try:
-            count = int(result.strip())
-        except (ValueError, AttributeError):
-            count = 0
-        if count < expected:
-            logger.warning(f"VM count mismatch in {namespace}: found {count}, expected {expected}")
-            return False
-        return True
+        """Poll ``oc get vm`` until ``expected`` VMs exist, honoring the configured retry logic.
+
+        Without this retry, callers like ``validate_restored_vm_datasets`` (which sets a
+        patient interval=15/max_attempts=28 specifically to tolerate the VM restart that
+        happens right after a restore) would fail on the very first check — see ticket 006
+        live test, where the restore CR reported Completed while VMs were still coming up.
+        """
+        retry_logic = self._get_retry_logic()
+        interval = retry_logic.get("interval_between_checks", 5)
+        max_attempts = max(1, retry_logic.get("max_attempts", 1))
+        count = 0
+        for attempt in range(1, max_attempts + 1):
+            result = self._oc.run(cmd=f"oc get vm -n {namespace} --no-headers 2>/dev/null | wc -l")
+            try:
+                count = int(result.strip())
+            except (ValueError, AttributeError):
+                count = 0
+            if count >= expected:
+                return True
+            if attempt < max_attempts:
+                logger.warning(
+                    f"VM count mismatch in {namespace}: found {count}, expected {expected} "
+                    f"(attempt {attempt}/{max_attempts}, retrying in {interval}s)"
+                )
+                time.sleep(interval)
+        logger.warning(f"VM count mismatch in {namespace}: found {count}, expected {expected}")
+        return False
 
     def _check_all_vmis_running(self, namespace: str, expected: int) -> bool:
-        result = self._oc.run(cmd=f"oc get vmi -n {namespace} --no-headers 2>/dev/null | grep -c Running")
-        try:
-            count = int(result.strip())
-        except (ValueError, AttributeError):
-            count = 0
-        if count < expected:
-            logger.warning(f"Running VMI count in {namespace}: {count}/{expected}")
-            return False
-        return True
+        """Poll ``oc get vmi`` until ``expected`` VMIs are Running, honoring the configured retry logic.
+
+        See ``_check_vm_count`` docstring — same reasoning applies here.
+        """
+        retry_logic = self._get_retry_logic()
+        interval = retry_logic.get("interval_between_checks", 5)
+        max_attempts = max(1, retry_logic.get("max_attempts", 1))
+        count = 0
+        for attempt in range(1, max_attempts + 1):
+            result = self._oc.run(cmd=f"oc get vmi -n {namespace} --no-headers 2>/dev/null | grep -c Running")
+            try:
+                count = int(result.strip())
+            except (ValueError, AttributeError):
+                count = 0
+            if count >= expected:
+                return True
+            if attempt < max_attempts:
+                logger.warning(
+                    f"Running VMI count in {namespace}: {count}/{expected} "
+                    f"(attempt {attempt}/{max_attempts}, retrying in {interval}s)"
+                )
+                time.sleep(interval)
+        logger.warning(f"Running VMI count in {namespace}: {count}/{expected}")
+        return False
 
     def _validate_vm_data_sample(
         self,

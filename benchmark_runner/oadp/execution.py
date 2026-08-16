@@ -14,6 +14,7 @@ from benchmark_runner.oadp.constants import (
     DEFAULT_TESTCASE_TIMEOUT,
     FILE_LEVEL_PLUGINS,
     PLUGIN_CSI,
+    PLUGIN_KUBEVIRT,
     PLUGIN_VBD,
     SOURCE_UPSTREAM,
 )
@@ -63,6 +64,12 @@ class OadpExecutionMixin:
                 backup_cmd = ssh.run(cmd=f"{base_cmd} --default-volumes-to-fs-backup=true --snapshot-volumes=false")
             elif plugin == PLUGIN_VBD:
                 backup_cmd = ssh.run(cmd=f"{base_cmd} --snapshot-move-data=true")
+            elif plugin == PLUGIN_KUBEVIRT:
+                # VM disks need the kubevirt-datamover plugin to actually copy data into the
+                # BSL — a bare CSI snapshot (the "else" default below) is not portable/durable
+                # on its own. See ticket 006: a live test caught this defaulting silently to a
+                # snapshot-only backup (snapshotMoveData: false, no DataUpload CRs created).
+                backup_cmd = ssh.run(cmd=f"{base_cmd} --data-mover 'velero' --snapshot-move-data=true")
             elif plugin == PLUGIN_CSI:
                 backup_cmd = ssh.run(cmd=base_cmd)
             else:
@@ -80,7 +87,7 @@ class OadpExecutionMixin:
                 backup_cmd = ssh.run(cmd=f"{base_cmd} --default-volumes-to-fs-backup=true --snapshot-volumes=false{ns_flag}")
             elif plugin == PLUGIN_CSI:
                 backup_cmd = ssh.run(cmd=f"{base_cmd}{ns_flag}")
-            elif plugin == PLUGIN_VBD:
+            elif plugin in (PLUGIN_VBD, PLUGIN_KUBEVIRT):
                 backup_cmd = ssh.run(cmd=f"{base_cmd} --data-mover 'velero' --snapshot-move-data=true{ns_flag}")
             else:
                 backup_cmd = ssh.run(cmd=f"{base_cmd}{ns_flag}")
