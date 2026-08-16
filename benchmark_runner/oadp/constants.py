@@ -15,6 +15,15 @@ MPQE_MISC_DIR = "/tmp/mpqe-scale-scripts/misc-scripts"
 MPQE_SCENARIO_DATA = "/tmp/mpqe-scale-scripts/oadp-helpers/templates/internal_data/tests.yaml"
 MPQE_PROMQL_QUERIES = "/tmp/mpqe-scale-scripts/oadp-helpers/templates/metrics/metrics-oadp.yaml"
 
+MPQE_VM_SCRIPTS_PATH = "/tmp/mpqe-scale-scripts/oadp-helpers/Scripts"
+
+# VMsPopulation.sh's multi-NS loop always appends "-ns<i>" to the namespace
+# base name, even when only one namespace is requested (-ns 1, the only
+# value benchmark-runner passes today). Script-based VM scenarios must set
+# their dataset/args namespace to end with this suffix; vm_operations strips
+# it before passing the base name via -namespace.
+MPQE_VM_SCRIPT_NS_SUFFIX = "-ns1"
+
 # ---------------------------------------------------------------------------
 # Velero CLI paths
 # ---------------------------------------------------------------------------
@@ -127,6 +136,15 @@ VM_DEFAULT_BATCH_SIZE = 10
 VM_DEFAULT_THROTTLE_BATCHES = 5
 VM_DEFAULT_POPULATION_CONCURRENCY = 10
 VM_DEFAULT_SSH_USER = "cloud-user"
+
+# VM population method: "native" drives the Python pipeline (create_vm_dataset),
+# "script" drives the mpqe-scale-scripts shell scripts (create_vm_dataset_via_script).
+VM_POPULATION_METHOD_NATIVE = "native"
+VM_POPULATION_METHOD_SCRIPT = "script"
+KNOWN_VM_POPULATION_METHODS = frozenset({VM_POPULATION_METHOD_NATIVE, VM_POPULATION_METHOD_SCRIPT})
+
+# VMsAddDataVerify.sh increment levels (see ticket 022)
+KNOWN_INCREMENT_LEVELS = frozenset({"inc1", "inc2", "inc3"})
 
 # Characters forbidden in scenario string values that flow into shell commands
 SHELL_METACHARACTERS = frozenset(";|&$`(){}><\n\r")

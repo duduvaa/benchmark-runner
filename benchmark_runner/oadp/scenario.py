@@ -14,11 +14,16 @@ from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time
 from benchmark_runner.oadp.constants import (
     ES_INDEX_PREFIX_DOWNSTREAM,
     ES_INDEX_PREFIX_UPSTREAM,
+    KNOWN_INCREMENT_LEVELS,
     KNOWN_PLUGINS,
+    KNOWN_VM_POPULATION_METHODS,
+    MPQE_VM_SCRIPT_NS_SUFFIX,
     PLUGIN_KUBEVIRT,
     SHELL_METACHARACTERS,
     SOURCE_UPSTREAM,
     VM_DATASET_ROLE,
+    VM_POPULATION_METHOD_NATIVE,
+    VM_POPULATION_METHOD_SCRIPT,
 )
 from benchmark_runner.oadp.oadp_exceptions import OadpError
 
@@ -125,6 +130,12 @@ class OadpScenarioMixin:
             if not self._validate_no_shell_metacharacters(args, "args"):
                 return False
 
+            if not self._validate_vm_population_args(args):
+                return False
+
+            if not self._validate_increment_level(args):
+                return False
+
         if scenario_includes_kubevirt_dataset(scenario):
             plugin = scenario.get("args", {}).get("plugin", "")
             if plugin != PLUGIN_KUBEVIRT:
@@ -133,6 +144,10 @@ class OadpScenarioMixin:
                     f"got 'plugin: {plugin}'. The kubevirt Velero plugin is needed for VM backups."
                 )
                 return False
+
+            if scenario.get("args", {}).get("vm_population_method") == VM_POPULATION_METHOD_SCRIPT:
+                if not self._validate_script_population_namespace(scenario):
+                    return False
 
         if not self._validate_no_shell_metacharacters(scenario, "scenario"):
             return False
@@ -168,6 +183,112 @@ class OadpScenarioMixin:
                         if any(ch in value for ch in SHELL_METACHARACTERS) or "'" in value:
                             logger.error(f"Error: disk_overrides field '{key}' contains forbidden characters: {value!r}")
                             return False
+        return True
+
+    @staticmethod
+    def _validate_vm_population_args(args: dict) -> bool:
+        """Validate 'vm_population_method' / 'vm_population_script_args' (plan 1.2).
+
+        Defaults to the native Python pipeline when 'vm_population_method' is
+        absent. When set to 'script', requires 'vm_population_script_args'
+        with 'vms' (positive int) and 'data_disks' (non-negative int; 0 means
+        OS disk only), and validates the optional 'cbt' boolean flag.
+        """
+        method = args.get("vm_population_method", VM_POPULATION_METHOD_NATIVE)
+        if method not in KNOWN_VM_POPULATION_METHODS:
+            logger.error(
+                f"Error: Unknown vm_population_method '{method}'. Allowed: {sorted(KNOWN_VM_POPULATION_METHODS)}"
+            )
+            return False
+
+        if method != VM_POPULATION_METHOD_SCRIPT:
+            return True
+
+        script_args = args.get("vm_population_script_args")
+        if not isinstance(script_args, dict):
+            logger.error(
+                "Error: vm_population_method 'script' requires a 'vm_population_script_args' "
+                "dict with 'vms' and 'data_disks'."
+            )
+            return False
+
+        if "vms" not in script_args or "data_disks" not in script_args:
+            logger.error("Error: vm_population_script_args requires both 'vms' and 'data_disks'.")
+            return False
+
+        vms = script_args.get("vms")
+        if not isinstance(vms, int) or isinstance(vms, bool) or vms < 1:
+            logger.error(f"Error: vm_population_script_args.vms must be a positive integer, got {vms!r}")
+            return False
+
+        data_disks = script_args.get("data_disks")
+        if not isinstance(data_disks, int) or isinstance(data_disks, bool) or data_disks < 0:
+            logger.error(
+                f"Error: vm_population_script_args.data_disks must be a non-negative integer, got {data_disks!r}"
+            )
+            return False
+
+        cbt = script_args.get("cbt", False)
+        if not isinstance(cbt, bool):
+            logger.error(f"Error: vm_population_script_args.cbt must be a boolean, got {cbt!r}")
+            return False
+
+        for key, value in script_args.items():
+            if isinstance(value, str) and (any(ch in value for ch in SHELL_METACHARACTERS) or "'" in value):
+                logger.error(
+                    f"Error: vm_population_script_args field '{key}' contains forbidden shell metacharacters: {value!r}"
+                )
+                return False
+
+        return True
+
+    @staticmethod
+    def _validate_increment_level(args: dict) -> bool:
+        """Validate the optional 'increment_level' arg (plan: incremental backup scenarios).
+
+        Only meaningful for script-populated VMs — VMsAddDataVerify.sh's
+        increment folders (inc1/inc2/inc3) assume the disk layout
+        VMsPopulation.sh creates.
+        """
+        increment_level = args.get("increment_level")
+        if increment_level is None:
+            return True
+
+        if increment_level not in KNOWN_INCREMENT_LEVELS:
+            logger.error(
+                f"Error: Unknown increment_level '{increment_level}'. Allowed: {sorted(KNOWN_INCREMENT_LEVELS)}"
+            )
+            return False
+
+        if args.get("vm_population_method") != VM_POPULATION_METHOD_SCRIPT:
+            logger.error(
+                "Error: 'increment_level' requires vm_population_method 'script' "
+                "(VMsAddDataVerify.sh's incremental data model only applies to script-populated VMs)."
+            )
+            return False
+
+        return True
+
+    @staticmethod
+    def _validate_script_population_namespace(scenario: dict) -> bool:
+        """Script-based population always creates '<base>-ns1' (VMsPopulation.sh's
+        multi-NS loop always appends '-ns<i>', even at -ns 1). The scenario's
+        effective namespace must already carry that suffix so vm_operations can
+        strip it and reconstruct the exact base name the script expects.
+        """
+        dataset_value = scenario.get("dataset")
+        namespace = ""
+        if isinstance(dataset_value, dict):
+            namespace = dataset_value.get("namespace", scenario.get("args", {}).get("namespaces_to_backup", ""))
+        elif isinstance(dataset_value, list):
+            namespace = scenario.get("args", {}).get("namespaces_to_backup", "")
+
+        if not namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX):
+            logger.error(
+                f"Error: vm_population_method 'script' requires the dataset namespace to end with "
+                f"'{MPQE_VM_SCRIPT_NS_SUFFIX}' (VMsPopulation.sh always appends this suffix), got '{namespace}'."
+            )
+            return False
         return True
 
     @staticmethod

@@ -10,11 +10,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from benchmark_runner.oadp.constants import (
+    KNOWN_INCREMENT_LEVELS,
     KNOWN_PLUGINS,
+    KNOWN_VM_POPULATION_METHODS,
+    MPQE_VM_SCRIPT_NS_SUFFIX,
+    MPQE_VM_SCRIPTS_PATH,
     SHELL_METACHARACTERS,
     VM_DATASET_ROLE,
     VM_DEFAULT_SSH_USER,
+    VM_POPULATION_METHOD_SCRIPT,
 )
+from benchmark_runner.oadp.dataset import OadpDatasetMixin
 from benchmark_runner.oadp.scenario import OadpScenarioMixin, scenario_includes_kubevirt_dataset
 from benchmark_runner.oadp.vm_operations import OadpVmOperationsMixin
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
@@ -53,6 +59,17 @@ def _kubevirt_scenario(**overrides):
         },
         "args": _valid_args(),
     }
+    s.update(overrides)
+    return s
+
+
+def _script_kubevirt_scenario(**overrides):
+    s = _kubevirt_scenario()
+    s["dataset"]["namespace"] = "kubevirt-script-2vm-1data-ns1"
+    s["args"] = _valid_args(
+        vm_population_method="script",
+        vm_population_script_args={"vms": 2, "data_disks": 1, "cbt": False},
+    )
     s.update(overrides)
     return s
 
@@ -105,6 +122,7 @@ class OadpWorkloads:
         self.__retry_logic = {"interval_between_checks": 5, "max_attempts": 1}
         self.__ssh = MagicMock()
         self._oc = MagicMock()
+        self._run_artifacts_path = ""
 
     def fail_test_run(self, msg: str) -> None:
         raise RuntimeError(msg)
@@ -134,6 +152,16 @@ class TestableVmOps(OadpVmOperationsMixin, OadpWorkloads):
 
 
 class TestableVmValidation(OadpVmValidationMixin, OadpVmOperationsMixin, OadpWorkloads):
+    __test__ = False
+
+
+class TestableDataset(OadpDatasetMixin, OadpVmOperationsMixin, OadpWorkloads):
+    __test__ = False
+
+
+class TestableIncrementalData(
+    OadpVmOperationsMixin, OadpVmValidationMixin, OadpScenarioMixin, OadpWorkloads
+):
     __test__ = False
 
 
@@ -777,3 +805,677 @@ class TestConstants:
         assert len(SHELL_METACHARACTERS) > 0
         assert ";" in SHELL_METACHARACTERS
         assert "|" in SHELL_METACHARACTERS
+
+
+# ===========================================================================
+# 15. vm_population_method / vm_population_script_args scenario validation
+# ===========================================================================
+
+
+class TestVmPopulationMethodValidation:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_defaults_to_native_when_absent(self, mx):
+        s = _kubevirt_scenario()
+        assert "vm_population_method" not in s["args"]
+        assert mx.validate_scenario(s) is True
+
+    def test_explicit_native_valid(self, mx):
+        s = _kubevirt_scenario(args=_valid_args(vm_population_method="native"))
+        assert mx.validate_scenario(s) is True
+
+    def test_unknown_method_rejected(self, mx):
+        s = _kubevirt_scenario(args=_valid_args(vm_population_method="bogus"))
+        assert mx.validate_scenario(s) is False
+
+    def test_known_methods_are_native_and_script(self):
+        assert KNOWN_VM_POPULATION_METHODS == {"native", "script"}
+
+    def test_valid_script_scenario(self, mx):
+        assert mx.validate_scenario(_script_kubevirt_scenario()) is True
+
+    def test_script_without_script_args_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        del s["args"]["vm_population_script_args"]
+        assert mx.validate_scenario(s) is False
+
+    def test_script_args_not_a_dict_rejected(self, mx):
+        s = _script_kubevirt_scenario(args=_valid_args(vm_population_method="script", vm_population_script_args="oops"))
+        assert mx.validate_scenario(s) is False
+
+    def test_script_args_missing_vms_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        del s["args"]["vm_population_script_args"]["vms"]
+        assert mx.validate_scenario(s) is False
+
+    def test_script_args_missing_data_disks_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        del s["args"]["vm_population_script_args"]["data_disks"]
+        assert mx.validate_scenario(s) is False
+
+    @pytest.mark.parametrize("vms", [0, -1, "2", 2.5, True])
+    def test_script_args_bad_vms_rejected(self, mx, vms):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["vms"] = vms
+        assert mx.validate_scenario(s) is False
+
+    @pytest.mark.parametrize("data_disks", [-1, "1", 1.5, False])
+    def test_script_args_bad_data_disks_rejected(self, mx, data_disks):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["data_disks"] = data_disks
+        # False is a valid bool but not accepted as data_disks (must be int, not bool)
+        assert mx.validate_scenario(s) is False
+
+    def test_script_args_data_disks_zero_is_valid(self, mx):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["data_disks"] = 0
+        assert mx.validate_scenario(s) is True
+
+    def test_script_args_bad_cbt_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = "yes"
+        assert mx.validate_scenario(s) is False
+
+    def test_script_args_cbt_defaults_when_absent(self, mx):
+        s = _script_kubevirt_scenario()
+        del s["args"]["vm_population_script_args"]["cbt"]
+        assert mx.validate_scenario(s) is True
+
+    def test_script_args_metachar_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["extra"] = "value;rm -rf /"
+        assert mx.validate_scenario(s) is False
+
+    def test_script_namespace_missing_ns1_suffix_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        s["dataset"]["namespace"] = "kubevirt-script-2vm-1data"
+        assert mx.validate_scenario(s) is False
+
+    def test_script_namespace_from_namespaces_to_backup_when_dataset_is_list(self, mx):
+        s = _script_kubevirt_scenario(
+            dataset=[
+                {
+                    "role": "kubevirt",
+                    "vm_profile": "rhel9-hammerdb-mariadb",
+                    "vms_per_namespace": 2,
+                    "sc": "s",
+                    "namespace": "kubevirt-script-2vm-1data-ns1",
+                }
+            ],
+        )
+        s["args"]["namespace_to_backup"] = "kubevirt-script-2vm-1data-ns1"
+        s["args"]["namespaces_to_backup"] = "kubevirt-script-2vm-1data-ns1"
+        assert mx.validate_scenario(s) is True
+
+
+# ===========================================================================
+# 16. _mpqe_namespace_base
+# ===========================================================================
+
+
+class TestMpqeNamespaceBase:
+    def test_strips_ns1_suffix(self):
+        assert OadpVmOperationsMixin._mpqe_namespace_base("kubevirt-script-2vm-ns1") == "kubevirt-script-2vm"
+
+    def test_no_suffix_left_unchanged(self):
+        assert OadpVmOperationsMixin._mpqe_namespace_base("kubevirt-minimal-ns") == "kubevirt-minimal-ns"
+
+    def test_suffix_constant_matches_expectation(self):
+        assert MPQE_VM_SCRIPT_NS_SUFFIX == "-ns1"
+
+
+# ===========================================================================
+# 17. create_vm_dataset_via_script / _run_vm_script
+# ===========================================================================
+
+
+class TestCreateVmDatasetViaScript:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    def _ds(self, namespace="kubevirt-script-2vm-1data-ns1"):
+        return {"namespace": namespace}
+
+    def test_builds_expected_command(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        scenario = _script_kubevirt_scenario()
+        mx.create_vm_dataset_via_script(scenario, self._ds())
+
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert f"{MPQE_VM_SCRIPTS_PATH}/VMsPopulation.sh" in cmd
+        assert "-vms 2" in cmd
+        assert "-disks 1" in cmd
+        assert "-ns 1" in cmd
+        assert "-namespace kubevirt-script-2vm-1data" in cmd
+        assert "-cbt" not in cmd
+
+    def test_includes_cbt_flag_when_enabled(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.check_cbt_state = MagicMock(return_value={})
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.create_vm_dataset_via_script(scenario, self._ds())
+
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-cbt" in cmd.split(";")[0]
+
+    def test_fails_test_run_on_nonzero_exit(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "some script output\nMPQE_SCRIPT_EXIT_CODE:1"
+        scenario = _script_kubevirt_scenario()
+        with pytest.raises(RuntimeError, match="exit code 1"):
+            mx.create_vm_dataset_via_script(scenario, self._ds())
+
+    def test_missing_exit_marker_treated_as_failure(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "unexpected output with no marker"
+        scenario = _script_kubevirt_scenario()
+        with pytest.raises(RuntimeError):
+            mx.create_vm_dataset_via_script(scenario, self._ds())
+
+    def test_defaults_when_script_args_missing(self, mx):
+        """vms/data_disks/cbt default sensibly even if the dict is sparse."""
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["vm_population_script_args"] = {"vms": 3, "data_disks": 2}
+        mx.create_vm_dataset_via_script(scenario, self._ds())
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-vms 3" in cmd
+        assert "-disks 2" in cmd
+        assert "-cbt" not in cmd
+
+    def test_cbt_enabled_checks_and_records_state_after_creation(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.check_cbt_state = MagicMock(return_value={"vm-0": {"state": "Enabled", "label": "true"}})
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.create_vm_dataset_via_script(scenario, self._ds())
+
+        mx.check_cbt_state.assert_called_once_with("kubevirt-script-2vm-1data-ns1")
+        assert mx._OadpWorkloads__run_metadata["summary"]["validations"]["cbt_state"] == {
+            "kubevirt-script-2vm-1data-ns1": {"vm-0": {"state": "Enabled", "label": "true"}}
+        }
+
+    def test_cbt_disabled_skips_state_check(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.check_cbt_state = MagicMock()
+        scenario = _script_kubevirt_scenario()
+        mx.create_vm_dataset_via_script(scenario, self._ds())
+        mx.check_cbt_state.assert_not_called()
+
+
+# ===========================================================================
+# 20. enable_cbt_on_vms / check_cbt_state
+# ===========================================================================
+
+
+class TestEnableCbtOnVms:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    def test_invokes_expected_command(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.enable_cbt_on_vms("kubevirt-script-2vm-1data-ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert cmd.startswith(f"{MPQE_VM_SCRIPTS_PATH}/VMsEnableCBT.sh -ns kubevirt-script-2vm-1data-ns1")
+
+    def test_fails_test_run_on_nonzero_exit(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:1"
+        with pytest.raises(RuntimeError, match="exit code 1"):
+            mx.enable_cbt_on_vms("kubevirt-script-2vm-1data-ns1")
+
+
+class TestCheckCbtState:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    _SAMPLE_OUTPUT = (
+        "========================================================================\n"
+        "===     Verify CBT state and labels for VMS in NameSpace: kubevirt-script-2vm-1data-ns1     ===\n"
+        "========================================================================\n"
+        "Verify CBT state and label for VM: oadp-vm-rhel9-hammerdb-mariadb-0 , NameSpace: kubevirt-script-2vm-1data-ns1\n"
+        "CBT State: Enabled\n"
+        "CBT label: true\n"
+        "Verify CBT state and label for VM: oadp-vm-rhel9-hammerdb-mariadb-1 , NameSpace: kubevirt-script-2vm-1data-ns1\n"
+        "CBT State: Enabled\n"
+        "CBT label: true\n"
+        " \n"
+    )
+
+    def test_parses_per_vm_state_and_label(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = self._SAMPLE_OUTPUT
+        result = mx.check_cbt_state("kubevirt-script-2vm-1data-ns1")
+        assert result == {
+            "oadp-vm-rhel9-hammerdb-mariadb-0": {"state": "Enabled", "label": "true"},
+            "oadp-vm-rhel9-hammerdb-mariadb-1": {"state": "Enabled", "label": "true"},
+        }
+
+    def test_invokes_expected_command(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = ""
+        mx.check_cbt_state("kubevirt-script-2vm-1data-ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert cmd == f"{MPQE_VM_SCRIPTS_PATH}/VMsCBTstate.sh -ns kubevirt-script-2vm-1data-ns1"
+
+    def test_empty_output_returns_empty_dict(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = ""
+        assert mx.check_cbt_state("ns") == {}
+
+    def test_missing_label_line_defaults_to_empty_string(self, mx):
+        output = (
+            "Verify CBT state and label for VM: vm-0 , NameSpace: ns\n"
+            "CBT State: Enabled\n"
+        )
+        mx._OadpWorkloads__ssh.run.return_value = output
+        result = mx.check_cbt_state("ns")
+        assert result == {"vm-0": {"state": "Enabled", "label": ""}}
+
+
+class TestRecordCbtState:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    def test_records_under_validations(self, mx):
+        mx._record_cbt_state("ns1", {"vm-0": {"state": "Enabled", "label": "true"}})
+        assert mx._OadpWorkloads__run_metadata["summary"]["validations"]["cbt_state"] == {
+            "ns1": {"vm-0": {"state": "Enabled", "label": "true"}}
+        }
+
+    def test_multiple_namespaces_accumulate(self, mx):
+        mx._record_cbt_state("ns1", {"vm-0": {"state": "Enabled", "label": "true"}})
+        mx._record_cbt_state("ns2", {"vm-1": {"state": "Disabled", "label": ""}})
+        cbt_state = mx._OadpWorkloads__run_metadata["summary"]["validations"]["cbt_state"]
+        assert set(cbt_state.keys()) == {"ns1", "ns2"}
+
+
+# ===========================================================================
+# 21. increment_level scenario validation
+# ===========================================================================
+
+
+class TestIncrementLevelValidation:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_absent_is_valid(self, mx):
+        s = _script_kubevirt_scenario()
+        assert "increment_level" not in s["args"]
+        assert mx.validate_scenario(s) is True
+
+    @pytest.mark.parametrize("level", ["inc1", "inc2", "inc3"])
+    def test_known_levels_valid_with_script_method(self, mx, level):
+        s = _script_kubevirt_scenario(args=_valid_args(
+            vm_population_method="script",
+            vm_population_script_args={"vms": 2, "data_disks": 1},
+            increment_level=level,
+        ))
+        assert mx.validate_scenario(s) is True
+
+    def test_unknown_level_rejected(self, mx):
+        s = _script_kubevirt_scenario(args=_valid_args(
+            vm_population_method="script",
+            vm_population_script_args={"vms": 2, "data_disks": 1},
+            increment_level="inc4",
+        ))
+        assert mx.validate_scenario(s) is False
+
+    def test_level_with_native_method_rejected(self, mx):
+        s = _kubevirt_scenario(args=_valid_args(increment_level="inc1"))
+        assert mx.validate_scenario(s) is False
+
+    def test_known_increment_levels_constant(self):
+        assert KNOWN_INCREMENT_LEVELS == {"inc1", "inc2", "inc3"}
+
+
+# ===========================================================================
+# 22. add_incremental_data / apply_incremental_data_if_requested
+# ===========================================================================
+
+
+class TestAddIncrementalData:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    def test_invokes_expected_command(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.add_incremental_data("kubevirt-script-ns1", "inc1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert cmd.startswith(
+            f"{MPQE_VM_SCRIPTS_PATH}/VMsAddDataVerify.sh -ns kubevirt-script-ns1 -inc inc1"
+        )
+
+    def test_fails_test_run_on_nonzero_exit(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:1"
+        with pytest.raises(RuntimeError, match="exit code 1"):
+            mx.add_incremental_data("kubevirt-script-ns1", "inc1")
+
+
+class TestApplyIncrementalDataIfRequested:
+    @pytest.fixture
+    def mx(self):
+        obj = TestableIncrementalData()
+        obj._OadpWorkloads__scenario_datasets = [
+            {"namespace": "kubevirt-script-2vm-1data-ns1"},
+        ]
+        return obj
+
+    def test_noop_when_increment_level_absent(self, mx):
+        mx.add_incremental_data = MagicMock()
+        mx.verify_vm_data_via_script = MagicMock()
+        scenario = _script_kubevirt_scenario()
+        mx.apply_incremental_data_if_requested(scenario)
+        mx.add_incremental_data.assert_not_called()
+        mx.verify_vm_data_via_script.assert_not_called()
+
+    def test_adds_and_verifies_for_each_namespace(self, mx):
+        mx.add_incremental_data = MagicMock()
+        mx.verify_vm_data_via_script = MagicMock(return_value=True)
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["increment_level"] = "inc1"
+        mx.apply_incremental_data_if_requested(scenario)
+        mx.add_incremental_data.assert_called_once_with("kubevirt-script-2vm-1data-ns1", "inc1")
+        mx.verify_vm_data_via_script.assert_called_once_with("kubevirt-script-2vm-1data-ns1")
+
+    def test_fails_test_run_when_post_increment_verification_fails(self, mx):
+        mx.add_incremental_data = MagicMock()
+        mx.verify_vm_data_via_script = MagicMock(return_value=False)
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["increment_level"] = "inc2"
+        with pytest.raises(RuntimeError, match="Post-increment verification failed"):
+            mx.apply_incremental_data_if_requested(scenario)
+
+    def test_multiple_namespaces_all_processed(self, mx):
+        mx._OadpWorkloads__scenario_datasets = [
+            {"namespace": "ns-a"},
+            {"namespace": "ns-b"},
+        ]
+        mx.add_incremental_data = MagicMock()
+        mx.verify_vm_data_via_script = MagicMock(return_value=True)
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["increment_level"] = "inc3"
+        mx.apply_incremental_data_if_requested(scenario)
+        assert mx.add_incremental_data.call_count == 2
+        assert mx.verify_vm_data_via_script.call_count == 2
+
+
+# ===========================================================================
+# 18. Dispatch routing: create_source_dataset / recreate-on-failure path
+# ===========================================================================
+
+
+class TestScriptDispatchRouting:
+    @pytest.fixture
+    def mx(self):
+        return TestableDataset()
+
+    def test_native_method_dispatches_to_create_vm_dataset(self, mx):
+        mx.create_vm_dataset = MagicMock()
+        mx.create_vm_dataset_via_script = MagicMock()
+        scenario = _kubevirt_scenario()
+        ds = {**scenario["dataset"], "namespace": "vm-ns"}
+        mx.create_source_dataset(scenario, ds)
+        mx.create_vm_dataset.assert_called_once_with(scenario, ds)
+        mx.create_vm_dataset_via_script.assert_not_called()
+
+    def test_script_method_dispatches_to_create_vm_dataset_via_script(self, mx):
+        mx.create_vm_dataset = MagicMock()
+        mx.create_vm_dataset_via_script = MagicMock()
+        scenario = _script_kubevirt_scenario()
+        ds = {**scenario["dataset"]}
+        mx.create_source_dataset(scenario, ds)
+        mx.create_vm_dataset_via_script.assert_called_once_with(scenario, ds)
+        mx.create_vm_dataset.assert_not_called()
+
+
+class TestVmValidationRecreateDispatch:
+    @pytest.fixture
+    def mx(self):
+        obj = TestableVmValidation()
+        obj.create_vm_dataset = MagicMock()
+        obj.create_vm_dataset_via_script = MagicMock()
+        obj.validate_expected_vm_datasets = MagicMock(side_effect=[False, True])
+        return obj
+
+    def test_native_scenario_recreate_uses_native_path(self, mx):
+        scenario = _kubevirt_scenario()
+        ds = {**scenario["dataset"], "namespace": "vm-ns"}
+        mx._OadpWorkloads__oadp_ds_failing_validation = [ds]
+        mx.verify_vm_datasets_before_backups(scenario)
+        mx.create_vm_dataset.assert_called_once_with(scenario, ds)
+        mx.create_vm_dataset_via_script.assert_not_called()
+
+    def test_script_scenario_recreate_uses_script_path(self, mx):
+        scenario = _script_kubevirt_scenario()
+        ds = {**scenario["dataset"]}
+        mx._OadpWorkloads__oadp_ds_failing_validation = [ds]
+        mx.verify_vm_datasets_before_backups(scenario)
+        mx.create_vm_dataset_via_script.assert_called_once_with(scenario, ds)
+        mx.create_vm_dataset.assert_not_called()
+
+
+# ===========================================================================
+# 19. verify_vm_data_via_script
+# ===========================================================================
+
+
+class TestVerifyVmDataViaScript:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmValidation()
+
+    def test_verify_passed(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "========\nVERIFY PASSED\n========"
+        assert mx.verify_vm_data_via_script("kubevirt-script-ns1") is True
+
+    def test_verify_failed(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "========\nVERIFY FAILED\n========"
+        assert mx.verify_vm_data_via_script("kubevirt-script-ns1") is False
+
+    def test_neither_marker_treated_as_failed(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "unexpected crash output"
+        assert mx.verify_vm_data_via_script("kubevirt-script-ns1") is False
+
+    def test_invokes_expected_command(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "VERIFY PASSED"
+        mx.verify_vm_data_via_script("kubevirt-script-ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert cmd == f"{MPQE_VM_SCRIPTS_PATH}/VMsAddDataVerify.sh -ns kubevirt-script-ns1 -verify-only"
+
+    def test_saves_output_artifact_when_path_set(self, mx, tmp_path):
+        mx._run_artifacts_path = str(tmp_path)
+        mx._OadpWorkloads__ssh.run.return_value = "VERIFY PASSED"
+        mx.verify_vm_data_via_script("kubevirt-script-ns1")
+        log_file = tmp_path / "vm_script_verify_kubevirt-script-ns1.log"
+        assert log_file.exists()
+        assert "VERIFY PASSED" in log_file.read_text()
+
+    def test_no_artifact_write_when_path_unset(self, mx):
+        """_run_artifacts_path is '' in the test stub — must not raise."""
+        mx._OadpWorkloads__ssh.run.return_value = "VERIFY PASSED"
+        mx.verify_vm_data_via_script("kubevirt-script-ns1")  # no exception
+
+
+class TestValidateVmDatasetScriptDispatch:
+    """_validate_vm_dataset must call verify_vm_data_via_script for script-populated
+    VMs instead of the native df-based sample/full checks, but only past the
+    existence checks and only when validation_mode isn't 'none'."""
+
+    @pytest.fixture
+    def mx(self):
+        return TestableVmValidation()
+
+    def _ds(self, namespace="kubevirt-script-2vm-1data-ns1", vms=2):
+        return {
+            "role": "kubevirt",
+            "vm_profile": "rhel9-hammerdb-mariadb",
+            "vms_per_namespace": vms,
+            "sc": "s",
+            "namespace": namespace,
+        }
+
+    def test_script_method_uses_script_verification(self, mx):
+        mx.get_dataset_validation_mode = lambda ds: "light"
+        mx._oc.run.side_effect = ["2", "2"]
+        mx.verify_vm_data_via_script = MagicMock(return_value=True)
+        mx._validate_vm_data_sample = MagicMock(return_value=False)
+        scenario = _script_kubevirt_scenario()
+        result = mx._validate_vm_dataset(scenario, self._ds())
+        assert result is True
+        mx.verify_vm_data_via_script.assert_called_once_with("kubevirt-script-2vm-1data-ns1")
+        mx._validate_vm_data_sample.assert_not_called()
+
+    def test_native_method_still_uses_sample_validation(self, mx):
+        mx.get_dataset_validation_mode = lambda ds: "light"
+        mx._oc.run.side_effect = ["2", "2"]
+        mx.verify_vm_data_via_script = MagicMock(return_value=False)
+        mx._validate_vm_data_sample = MagicMock(return_value=True)
+        scenario = _kubevirt_scenario()
+        result = mx._validate_vm_dataset(scenario, self._ds(namespace="vm-ns"))
+        assert result is True
+        mx._validate_vm_data_sample.assert_called_once()
+        mx.verify_vm_data_via_script.assert_not_called()
+
+    def test_script_method_none_mode_skips_script_verification_too(self, mx):
+        mx.get_dataset_validation_mode = lambda ds: "none"
+        mx._oc.run.side_effect = ["2", "2"]
+        mx.verify_vm_data_via_script = MagicMock(return_value=False)
+        scenario = _script_kubevirt_scenario()
+        result = mx._validate_vm_dataset(scenario, self._ds())
+        assert result is True
+        mx.verify_vm_data_via_script.assert_not_called()
+
+
+# ===========================================================================
+# 23. CBT flag propagation from scenario args through to CBT enablement
+#
+# vm_population_script_args.cbt propagates to CBT enablement via the -cbt
+# flag passed directly to VMsPopulation.sh (confirmed by check_cbt_state()
+# right after creation), rather than a separate enable_cbt_on_vms() call —
+# the alternative wiring named in ticket 021. enable_cbt_on_vms() remains
+# available standalone (e.g. to enable CBT on already-populated VMs) and is
+# covered on its own in TestEnableCbtOnVms.
+# ===========================================================================
+
+
+class TestCbtFlagPropagationFromScenario:
+    @pytest.fixture
+    def mx(self):
+        return TestableVmOps()
+
+    def test_cbt_true_in_scenario_reaches_population_command_and_is_confirmed(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.check_cbt_state = MagicMock(return_value={"vm-0": {"state": "Enabled", "label": "true"}})
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-ns1"})
+
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-cbt" in cmd.split(";")[0]
+        mx.check_cbt_state.assert_called_once_with("kubevirt-script-2vm-1data-ns1")
+
+    def test_cbt_false_in_scenario_never_enables_cbt(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        mx.check_cbt_state = MagicMock()
+        scenario = _script_kubevirt_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-ns1"})
+
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-cbt" not in cmd.split(";")[0]
+        mx.check_cbt_state.assert_not_called()
+
+
+# ===========================================================================
+# 24. Script-based tests.yaml scenarios (ticket 023) pass validate_scenario()
+#
+# Mirrors the 5 scenarios added to mpqe-scale-scripts'
+# oadp-helpers/templates/internal_data/tests.yaml so a regression in either
+# the scenario shape or the validator is caught here without needing the
+# external repo checked out.
+# ===========================================================================
+
+
+def _tests_yaml_script_scenario(name, testcase, testtype, vms, data_disks, namespace, cbt=False):
+    args = {
+        "plugin": "kubevirt",
+        "use_cli": True,
+        "OADP_CR_TYPE": testtype,
+        "OADP_CR_NAME": name,
+        "backup_name": name.replace("restore-", "backup-", 1) if testtype == "restore" else name,
+        "testcase_timeout": 79200,
+        "namespaces_to_backup": namespace,
+        "vm_population_method": "script",
+        "vm_population_script_args": {"vms": vms, "data_disks": data_disks, "cbt": cbt},
+    }
+    return {
+        "name": name,
+        "testcase": testcase,
+        "testtype": testtype,
+        "result_dir_base_path": "/tmp/results/",
+        "dataset": {
+            "role": "kubevirt",
+            "vm_profile": "rhel9-hammerdb-mariadb",
+            "vms_per_namespace": vms,
+            "sc": "ocs-storagecluster-ceph-rbd",
+            "pv_size": "60Gi",
+        },
+        "args": args,
+    }
+
+
+class TestScriptBasedScenariosFromTestsYaml:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_backup_2vm_1data(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-kubevirt-script-2vm-1data-cephrbd", 10.4, "backup",
+            vms=2, data_disks=1, namespace="kubevirt-script-2vm-1data-rbd-ns1",
+        )
+        assert mx.validate_scenario(s) is True
+
+    def test_restore_2vm_1data(self, mx):
+        s = _tests_yaml_script_scenario(
+            "restore-kubevirt-script-2vm-1data-cephrbd", 10.4, "restore",
+            vms=2, data_disks=1, namespace="kubevirt-script-2vm-1data-rbd-ns1",
+        )
+        assert mx.validate_scenario(s) is True
+
+    def test_backup_2vm_1data_cbt(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-kubevirt-script-2vm-1data-cbt-cephrbd", 10.5, "backup",
+            vms=2, data_disks=1, namespace="kubevirt-script-2vm-1data-cbt-rbd-ns1", cbt=True,
+        )
+        assert mx.validate_scenario(s) is True
+
+    def test_backup_10vm_1data_scale(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-kubevirt-script-10vm-1data-cephrbd", 10.6, "backup",
+            vms=10, data_disks=1, namespace="kubevirt-script-10vm-1data-rbd-ns1",
+        )
+        assert mx.validate_scenario(s) is True
+
+    def test_backup_2vm_2data_multidisk(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-kubevirt-script-2vm-2data-cephrbd", 10.7, "backup",
+            vms=2, data_disks=2, namespace="kubevirt-script-2vm-2data-rbd-ns1",
+        )
+        assert mx.validate_scenario(s) is True
+
+    def test_all_five_scenarios_have_unique_names(self):
+        names = {
+            "backup-kubevirt-script-2vm-1data-cephrbd",
+            "restore-kubevirt-script-2vm-1data-cephrbd",
+            "backup-kubevirt-script-2vm-1data-cbt-cephrbd",
+            "backup-kubevirt-script-10vm-1data-cephrbd",
+            "backup-kubevirt-script-2vm-2data-cephrbd",
+        }
+        assert len(names) == 5

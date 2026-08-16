@@ -10,15 +10,18 @@ Mirrors the pod validation flow in ``pod_validation.py`` and ``dataset.py``:
 
 from __future__ import annotations
 
+import os
 import random
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
 from benchmark_runner.oadp.constants import (
+    MPQE_VM_SCRIPTS_PATH,
     VALIDATION_MODE_FULL,
     VALIDATION_MODE_LIGHT,
     VALIDATION_MODE_NONE,
     VM_DATASET_ROLE,
     VM_DEFAULT_SSH_USER,
+    VM_POPULATION_METHOD_SCRIPT,
 )
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
 
@@ -51,7 +54,10 @@ class OadpVmValidationMixin:
                 logger.info(f"VM datasets not fully present; failing datasets: {len(failing)}")
                 for ds in failing:
                     if ds.get("role") == VM_DATASET_ROLE:
-                        self.create_vm_dataset(scenario, ds)
+                        if scenario["args"].get("vm_population_method") == VM_POPULATION_METHOD_SCRIPT:
+                            self.create_vm_dataset_via_script(scenario, ds)
+                        else:
+                            self.create_vm_dataset(scenario, ds)
 
                 recreated_ok = self.validate_expected_vm_datasets(scenario)
                 run_metadata["summary"]["validations"]["vm_dataset_recreated_as_expected"] = recreated_ok
@@ -119,6 +125,9 @@ class OadpVmValidationMixin:
             logger.info("VM dataset validation mode is 'none' — skipping data checks (VMs exist)")
             return True
 
+        if scenario.get("args", {}).get("vm_population_method") == VM_POPULATION_METHOD_SCRIPT:
+            return self.verify_vm_data_via_script(namespace)
+
         if validation_mode == VALIDATION_MODE_LIGHT:
             return self._validate_vm_data_sample(ds, namespace, expected_vms)
 
@@ -126,6 +135,52 @@ class OadpVmValidationMixin:
             return self._validate_vm_data_all(ds, namespace, expected_vms)
 
         return True
+
+    # ------------------------------------------------------------------
+    # Script-based data verification (Phase 1 script integration)
+    # ------------------------------------------------------------------
+
+    @logger_time_stamp
+    def verify_vm_data_via_script(self, namespace: str) -> bool:
+        """Verify VM data via ``VMsAddDataVerify.sh -verify-only`` (script-based population path).
+
+        Replaces the native df-based capacity check (``_validate_vm_data_sample``/
+        ``_validate_vm_data_all``) for script-populated VMs — the script handles
+        per-disk file-count and capacity verification internally against baseline
+        (157,000 files / ~45G on ``/home/data``, 105,000 files / ~30G per data
+        disk) and any existing increment folders. Raw output is saved to run
+        artifacts regardless of outcome, for debugging.
+        """
+        cmd = f"{MPQE_VM_SCRIPTS_PATH}/VMsAddDataVerify.sh -ns {namespace} -verify-only"
+        logger.info(f"Running script-based VM data verification: {cmd}")
+        output = self._OadpWorkloads__ssh.run(cmd=cmd) or ""
+        self._save_vm_script_output(namespace, "verify", output)
+
+        if "VERIFY PASSED" in output:
+            logger.info(f"Script-based verification PASSED for namespace {namespace}")
+            return True
+        if "VERIFY FAILED" in output:
+            logger.warning(f"Script-based verification FAILED for namespace {namespace}")
+            return False
+        logger.warning(
+            f"Script-based verification for {namespace} produced neither 'VERIFY PASSED' nor "
+            f"'VERIFY FAILED' — treating as failed. Output:\n{output}"
+        )
+        return False
+
+    def _save_vm_script_output(self, namespace: str, label: str, output: str) -> None:
+        """Persist raw external-script output to run artifacts for debugging."""
+        try:
+            artifacts_path = self._run_artifacts_path
+            if not artifacts_path:
+                return
+            os.makedirs(artifacts_path, exist_ok=True)
+            log_file = os.path.join(artifacts_path, f"vm_script_{label}_{namespace}.log")
+            with open(log_file, "w") as f:
+                f.write(output)
+            logger.info(f"Saved {label} script output to {log_file}")
+        except OSError as err:
+            logger.warning(f"Could not save {label} script output for {namespace}: {err}")
 
     # ------------------------------------------------------------------
     # Individual checks

@@ -271,6 +271,7 @@ class OadpWorkloads(
         if test_scenario["args"]["OADP_CR_TYPE"] == "backup":
             if has_vm_datasets:
                 self.verify_vm_datasets_before_backups(test_scenario)
+                self.apply_incremental_data_if_requested(test_scenario)
             else:
                 self.verify_datsets_before_backups(test_scenario)
 

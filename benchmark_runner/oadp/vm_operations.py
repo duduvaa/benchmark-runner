@@ -20,6 +20,8 @@ from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time
 from benchmark_runner.common.oc.oc import OC
 from benchmark_runner.common.virtctl.virtctl import Virtctl
 from benchmark_runner.oadp.constants import (
+    MPQE_VM_SCRIPT_NS_SUFFIX,
+    MPQE_VM_SCRIPTS_PATH,
     SHELL_METACHARACTERS,
     VM_DEFAULT_BATCH_SIZE,
     VM_DEFAULT_POPULATION_CONCURRENCY,
@@ -133,6 +135,176 @@ class OadpVmOperationsMixin:
                 vms_per_ns,
                 scenario,
             )
+
+    # ------------------------------------------------------------------
+    # Script-based VM population (Phase 1 script integration — plan 1.3/1.4)
+    # ------------------------------------------------------------------
+
+    _SCRIPT_EXIT_CODE_MARKER = "MPQE_SCRIPT_EXIT_CODE"
+
+    def _run_vm_script(self, cmd: str, log_label: str) -> str:
+        """Run an external mpqe-scale-scripts VM lifecycle script synchronously.
+
+        Uses the raw shell client (``self.__ssh``, accessed via its mangled
+        name since this mixin isn't ``OadpWorkloads`` itself) rather than
+        ``self._oc``, matching how the rest of the OADP module invokes
+        standalone external scripts. ``SSH.run()``'s default path returns
+        merged stdout/stderr with no return code, and its ``is_check=True``
+        path imposes a short subprocess timeout unsuitable for these
+        long-running scripts — so the exit code is captured by appending an
+        ``echo`` marker to the command instead.
+
+        Calls ``self.fail_test_run()`` on non-zero exit.
+        """
+        ssh = self._OadpWorkloads__ssh
+        full_cmd = f"{cmd}; echo {self._SCRIPT_EXIT_CODE_MARKER}:$?"
+        logger.info(f"Running {log_label}: {cmd}")
+        output = ssh.run(cmd=full_cmd)
+        match = re.search(rf"{self._SCRIPT_EXIT_CODE_MARKER}:(\d+)", output or "")
+        exit_code = int(match.group(1)) if match else 1
+        if exit_code != 0:
+            logger.error(f"{log_label} failed (exit {exit_code}):\n{output}")
+            self.fail_test_run(f"{log_label} failed with exit code {exit_code}")
+        else:
+            logger.info(f"{log_label} completed successfully")
+        return output or ""
+
+    @staticmethod
+    def _mpqe_namespace_base(namespace: str) -> str:
+        """Strip the '-ns1' suffix VMsPopulation.sh always appends, since callers
+        pass the desired final namespace but the script re-adds that suffix itself.
+        """
+        if namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX):
+            return namespace[: -len(MPQE_VM_SCRIPT_NS_SUFFIX)]
+        return namespace
+
+    @logger_time_stamp
+    def create_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
+        """Create a KubeVirt VM dataset via VMsPopulation.sh (Phase 1 script-integration path).
+
+        Alternative to ``create_vm_dataset()`` for scenarios with
+        ``vm_population_method: script``. Blocks until the script completes —
+        it internally waits for VMs to boot, populates baseline data, and
+        (optionally) enables CBT before returning.
+        """
+        namespace = ds["namespace"]
+        script_args = scenario["args"].get("vm_population_script_args", {})
+        vms = int(script_args.get("vms", 1))
+        data_disks = int(script_args.get("data_disks", 1))
+        cbt = bool(script_args.get("cbt", False))
+        namespace_base = self._mpqe_namespace_base(namespace)
+
+        cmd = (
+            f"{MPQE_VM_SCRIPTS_PATH}/VMsPopulation.sh "
+            f"-vms {vms} -disks {data_disks} -ns 1 -namespace {namespace_base}"
+        )
+        if cbt:
+            cmd += " -cbt"
+
+        self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script")
+        self._run_vm_script(
+            cmd,
+            f"VMsPopulation.sh (namespace={namespace}, vms={vms}, data_disks={data_disks}, cbt={cbt})",
+        )
+        self.oadp_timer(action="stop", transaction_name="vm_dataset_creation_script")
+
+        if cbt:
+            cbt_state = self.check_cbt_state(namespace)
+            self._record_cbt_state(namespace, cbt_state)
+
+    # ------------------------------------------------------------------
+    # CBT (Changed Block Tracking) script integration
+    # ------------------------------------------------------------------
+
+    @logger_time_stamp
+    def enable_cbt_on_vms(self, namespace: str) -> None:
+        """Enable CBT on all VMs in a namespace via ``VMsEnableCBT.sh``.
+
+        The script runs the full lifecycle: power off, add the
+        ``changedBlockTracking=true`` label, power on, expand
+        ``persistent-state`` PVCs to 500Mi, restart. Prefer passing ``-cbt``
+        directly to ``VMsPopulation.sh`` at creation time
+        (``create_vm_dataset_via_script``) — this method exists for enabling
+        CBT on already-populated VMs.
+        """
+        cmd = f"{MPQE_VM_SCRIPTS_PATH}/VMsEnableCBT.sh -ns {namespace}"
+        self._run_vm_script(cmd, f"VMsEnableCBT.sh (namespace={namespace})")
+
+    _CBT_VM_LINE_RE = re.compile(r"^Verify CBT state and label for VM:\s*(\S+)\s*,")
+    _CBT_STATE_LINE_RE = re.compile(r"^CBT State:\s*(.*)$")
+    _CBT_LABEL_LINE_RE = re.compile(r"^CBT label:\s*(.*)$")
+
+    @logger_time_stamp
+    def check_cbt_state(self, namespace: str) -> dict:
+        """Check per-VM CBT state and label via ``VMsCBTstate.sh``.
+
+        Returns ``{vm_name: {"state": <changedBlockTracking.state>, "label": <label value>}}``.
+        """
+        cmd = f"{MPQE_VM_SCRIPTS_PATH}/VMsCBTstate.sh -ns {namespace}"
+        output = self._OadpWorkloads__ssh.run(cmd=cmd) or ""
+        result: dict = {}
+        current_vm = None
+        for line in output.splitlines():
+            vm_match = self._CBT_VM_LINE_RE.match(line.strip())
+            if vm_match:
+                current_vm = vm_match.group(1)
+                result[current_vm] = {"state": "", "label": ""}
+                continue
+            if current_vm is None:
+                continue
+            state_match = self._CBT_STATE_LINE_RE.match(line.strip())
+            if state_match:
+                result[current_vm]["state"] = state_match.group(1).strip()
+                continue
+            label_match = self._CBT_LABEL_LINE_RE.match(line.strip())
+            if label_match:
+                result[current_vm]["label"] = label_match.group(1).strip()
+        logger.info(f"CBT state for namespace {namespace}: {result}")
+        return result
+
+    def _record_cbt_state(self, namespace: str, cbt_state: dict) -> None:
+        """Record CBT state in run_metadata for reporting."""
+        run_metadata = self._OadpWorkloads__run_metadata
+        run_metadata["summary"]["validations"].setdefault("cbt_state", {})
+        run_metadata["summary"]["validations"]["cbt_state"][namespace] = cbt_state
+
+    # ------------------------------------------------------------------
+    # Incremental data (Phase 1 script integration — VMsAddDataVerify.sh -inc)
+    # ------------------------------------------------------------------
+
+    @logger_time_stamp
+    def add_incremental_data(self, namespace: str, increment_level: str) -> None:
+        """Generate incremental data on a script-populated namespace via ``VMsAddDataVerify.sh -inc``.
+
+        The script generates data on ``/home/data`` and every discovered data
+        disk, then self-verifies in the same invocation (non-zero exit on
+        failure, checked here via ``_run_vm_script``). Callers wanting an
+        explicit boolean confirmation beyond the exit code should follow up
+        with ``verify_vm_data_via_script()`` (see ``apply_incremental_data_if_requested``).
+        """
+        cmd = f"{MPQE_VM_SCRIPTS_PATH}/VMsAddDataVerify.sh -ns {namespace} -inc {increment_level}"
+        self._run_vm_script(cmd, f"VMsAddDataVerify.sh -inc {increment_level} (namespace={namespace})")
+
+    @logger_time_stamp
+    def apply_incremental_data_if_requested(self, scenario: dict) -> None:
+        """If 'increment_level' is set, add incremental data to every VM namespace
+        in the scenario before backup execution, then explicitly re-confirm via
+        ``verify_vm_data_via_script()`` (post-increment verification, plan item 4).
+
+        No-op when 'increment_level' is absent — the normal (non-incremental)
+        backup scenario path.
+        """
+        increment_level = scenario["args"].get("increment_level")
+        if not increment_level:
+            return
+
+        for namespace in self.ds_get_all_namespaces():
+            self.add_incremental_data(namespace, increment_level)
+            if not self.verify_vm_data_via_script(namespace):
+                self.fail_test_run(
+                    f"Post-increment verification failed for namespace {namespace} "
+                    f"after adding {increment_level}"
+                )
 
     # ------------------------------------------------------------------
     # Namespace

@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
-from benchmark_runner.oadp.constants import VM_DATASET_ROLE
+from benchmark_runner.oadp.constants import VM_DATASET_ROLE, VM_POPULATION_METHOD_SCRIPT
 
 
 class OadpDatasetMixin:
@@ -79,7 +79,10 @@ class OadpDatasetMixin:
             elif ds["role"] in ("generator", "dd_generator"):
                 self.create_multi_pvutil_dataset(scenario, ds)
             elif ds["role"] == VM_DATASET_ROLE:
-                self.create_vm_dataset(scenario, ds)
+                if scenario["args"].get("vm_population_method") == VM_POPULATION_METHOD_SCRIPT:
+                    self.create_vm_dataset_via_script(scenario, ds)
+                else:
+                    self.create_vm_dataset(scenario, ds)
         except Exception as err:
             self.fail_test_run(f" {err} occurred in " + self.get_current_function())
             raise err
