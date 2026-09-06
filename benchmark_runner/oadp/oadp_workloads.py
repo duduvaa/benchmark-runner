@@ -263,6 +263,18 @@ class OadpWorkloads(
                 self.config_dpa_for_plugin(scenario=test_scenario, oadp_namespace=self.__test_env["velero_ns"])
                 self.wait_for_dpa_changes(oadp_namespace=self.__test_env["velero_ns"])
                 self.verify_bsl_status()
+            # Flow2 (ticket 028): CBT-enabled kubevirt scenarios additionally need the
+            # 'kubevirt-datamover' plugin registered and a resource-policy ConfigMap in
+            # place. Both are no-ops for non-CBT scenarios.
+            datamover_plugin_added = self.ensure_kubevirt_datamover_plugin(
+                scenario=test_scenario, oadp_namespace=self.__test_env["velero_ns"]
+            )
+            if datamover_plugin_added:
+                self.wait_for_dpa_changes(oadp_namespace=self.__test_env["velero_ns"])
+                self.verify_bsl_status()
+            self.ensure_kubevirt_volume_policy_configmap(
+                scenario=test_scenario, oadp_namespace=self.__test_env["velero_ns"]
+            )
 
         self.get_bucket_details("velero")
 

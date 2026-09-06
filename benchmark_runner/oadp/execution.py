@@ -13,6 +13,7 @@ from benchmark_runner.oadp.constants import (
     CR_TERMINAL_STATES,
     DEFAULT_TESTCASE_TIMEOUT,
     FILE_LEVEL_PLUGINS,
+    KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
     PLUGIN_CSI,
     PLUGIN_KUBEVIRT,
     PLUGIN_VBD,
@@ -50,8 +51,22 @@ class OadpExecutionMixin:
             raise err
 
     @logger_time_stamp
-    def exec_backup(self, plugin: str, backup_name: str, namespaces_to_backup: str) -> None:
-        """Create a Velero backup with plugin-appropriate flags for downstream or upstream."""
+    def exec_backup(
+        self,
+        plugin: str,
+        backup_name: str,
+        namespaces_to_backup: str,
+        resource_policy_configmap: str | None = None,
+    ) -> None:
+        """Create a Velero backup with plugin-appropriate flags for downstream or upstream.
+
+        ``resource_policy_configmap``: Flow2 (ticket 028) — for CBT-enabled
+        kubevirt scenarios, ``oadp_execute_scenario()`` passes
+        ``KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME`` here so the backup CR
+        references the 'kubevirt-volume-policy' resource-policy ConfigMap via
+        ``--resource-policies-configmap``. ``None``/falsy for all other
+        scenarios (Flow1 and non-kubevirt plugins).
+        """
         test_env = self._OadpWorkloads__test_env
         ssh = self._OadpWorkloads__ssh
 
@@ -69,7 +84,15 @@ class OadpExecutionMixin:
                 # BSL — a bare CSI snapshot (the "else" default below) is not portable/durable
                 # on its own. See ticket 006: a live test caught this defaulting silently to a
                 # snapshot-only backup (snapshotMoveData: false, no DataUpload CRs created).
-                backup_cmd = ssh.run(cmd=f"{base_cmd} --data-mover 'velero' --snapshot-move-data=true")
+                kubevirt_cmd = f"{base_cmd} --data-mover 'velero' --snapshot-move-data=true"
+                if resource_policy_configmap:
+                    # Flow2 (ticket 028): CBT-enabled kubevirt backups. Without this,
+                    # Velero's own CSI-snapshot volume handling conflicts with the
+                    # kubevirt-datamover plugin's handling of CBT-labeled volumes —
+                    # observed live as "PVC ... has snapshot policy which conflicts
+                    # with kubevirt datamover" backup warnings during the TC 10.5 test.
+                    kubevirt_cmd += f" --resource-policies-configmap {resource_policy_configmap}"
+                backup_cmd = ssh.run(cmd=kubevirt_cmd)
             elif plugin == PLUGIN_CSI:
                 backup_cmd = ssh.run(cmd=base_cmd)
             else:
@@ -171,10 +194,16 @@ class OadpExecutionMixin:
                 cr_name = test_scenario["args"]["OADP_CR_NAME"]
                 if cr_type == "backup":
                     self.oadp_timer(action="start", transaction_name=cr_name)
+                    resource_policy_configmap = (
+                        KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME
+                        if self._scenario_needs_kubevirt_datamover_plugin(test_scenario)
+                        else None
+                    )
                     self.exec_backup(
                         plugin=test_scenario["args"]["plugin"],
                         backup_name=test_scenario["args"]["backup_name"],
                         namespaces_to_backup=namespaces_to_backup,
+                        resource_policy_configmap=resource_policy_configmap,
                     )
                     self.wait_for_condition_of_cr(
                         cr_type=cr_type,

@@ -2,13 +2,16 @@
 Mixin for DPA configuration, volume snapshot, and storage class setup.
 """
 
+import json
 import time
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
 from benchmark_runner.oadp.constants import (
     DEFAULT_DPA_NAME,
+    KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
     PLUGIN_CSI,
     PLUGIN_KUBEVIRT,
+    PLUGIN_KUBEVIRT_DATAMOVER,
     PLUGIN_RESTIC,
     PLUGIN_VBD,
     SC_CEPH_RBD,
@@ -63,6 +66,12 @@ class OadpConfigurationMixin:
                         "## WARNING ### is_dpa_change_needed: 'kubevirt' not in defaultPlugins but scenario uses VM datasets."
                     )
                     return True
+
+            # 'kubevirt-datamover' (Flow2, CBT scenarios) is deliberately NOT checked here:
+            # it's not managed by modify-dpa.yaml (the ansible playbook this function gates),
+            # so reporting a change here would trigger a no-op ansible run. It's verified and
+            # patched directly by ensure_kubevirt_datamover_plugin(), called unconditionally
+            # from oadp_workloads.py right after this DPA block.
 
             uploader_type = PLUGIN_RESTIC if scenario["args"]["plugin"] == PLUGIN_RESTIC else "kopia"
 
@@ -258,6 +267,107 @@ class OadpConfigurationMixin:
             self.fail_test_run(f" {err} occurred in " + self.get_current_function())
             raise err
 
+    # ------------------------------------------------------------------
+    # Flow2 setup: CBT-enabled kubevirt backups (ticket 028)
+    # ------------------------------------------------------------------
+
+    @logger_time_stamp
+    def ensure_kubevirt_datamover_plugin(self, scenario: dict, oadp_namespace: str) -> bool:
+        """Ensure 'kubevirt-datamover' is present in the DPA's defaultPlugins (Flow2).
+
+        No-op unless the scenario is CBT-enabled kubevirt (see
+        ``_scenario_needs_kubevirt_datamover_plugin``). Patches the DPA
+        directly via ``oc patch`` rather than routing through
+        ``modify-dpa.yaml`` (the ansible playbook only knows about the plain
+        'kubevirt' flag) — mirrors the JSON-patch approach already used by
+        ``set_velero_log_level()``.
+
+        Returns True if a patch was applied (caller should then re-run
+        ``wait_for_dpa_changes``/``verify_bsl_status``), False if already
+        present or not needed.
+        """
+        if not self._scenario_needs_kubevirt_datamover_plugin(scenario):
+            return False
+
+        dpa_data = self.get_oc_resource_to_json(
+            resource_type="dpa",
+            resource_name=self._OadpWorkloads__oadp_dpa,
+            namespace=oadp_namespace,
+        )
+        if not dpa_data:
+            logger.error(
+                ":: ERROR :: ensure_kubevirt_datamover_plugin: DPA not found; "
+                "cannot verify/add 'kubevirt-datamover' plugin"
+            )
+            self.fail_test_run("DPA not present while ensuring 'kubevirt-datamover' plugin")
+            return False
+
+        default_plugins = dpa_data.get("spec", {}).get("configuration", {}).get("velero", {}).get("defaultPlugins", [])
+        if PLUGIN_KUBEVIRT_DATAMOVER in default_plugins:
+            logger.info(
+                "### INFO ### ensure_kubevirt_datamover_plugin: 'kubevirt-datamover' already present in defaultPlugins"
+            )
+            return False
+
+        updated_plugins = [*default_plugins, PLUGIN_KUBEVIRT_DATAMOVER]
+        json_query = (
+            '[{"op": "replace", "path": "/spec/configuration/velero/defaultPlugins", "value": '
+            + json.dumps(updated_plugins)
+            + "}]"
+        )
+        self.patch_oc_resource(
+            resource_type="dpa",
+            resource_name=self._OadpWorkloads__oadp_dpa,
+            namespace=oadp_namespace,
+            patch_type="json",
+            patch_json=json_query,
+        )
+        logger.info(
+            f"### INFO ### ensure_kubevirt_datamover_plugin: added 'kubevirt-datamover' to defaultPlugins: "
+            f"{updated_plugins}"
+        )
+        return True
+
+    @logger_time_stamp
+    def ensure_kubevirt_volume_policy_configmap(self, scenario: dict, oadp_namespace: str) -> None:
+        """Ensure the 'kubevirt-volume-policy' resource-policy ConfigMap exists (Flow2).
+
+        No-op unless the scenario is CBT-enabled kubevirt (see
+        ``_scenario_needs_kubevirt_datamover_plugin``). Referenced by
+        ``exec_backup()`` via ``--resource-policies-configmap`` on CBT-enabled
+        kubevirt backups so Velero skips its own CSI-snapshot volume handling
+        for CBT-labeled volumes and lets the kubevirt-datamover plugin manage
+        them instead. ``oc apply`` is idempotent, so this is safe to call
+        unconditionally every run.
+        """
+        if not self._scenario_needs_kubevirt_datamover_plugin(scenario):
+            return
+
+        manifest = (
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            f"  name: {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}\n"
+            f"  namespace: {oadp_namespace}\n"
+            "data:\n"
+            "  policy.yaml: |\n"
+            "    version: v1\n"
+            "    volumePolicies:\n"
+            "      - conditions: {}\n"
+            "        action:\n"
+            "          type: skip\n"
+        )
+        result = self._OadpWorkloads__ssh.run(cmd=f"cat <<'EOF' | oc apply -f -\n{manifest}EOF")
+        expected_result_output = ["created", "unchanged", "configured"]
+        if not any(ext in result for ext in expected_result_output):
+            logger.error(
+                f":: ERROR :: ensure_kubevirt_volume_policy_configmap: apply failed for "
+                f"'{KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}' in {oadp_namespace}: {result}"
+            )
+            self.fail_test_run(f"Unable to apply {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME} ConfigMap")
+        else:
+            logger.info(f":: INFO :: ensure_kubevirt_volume_policy_configmap: {result}")
+
     @logger_time_stamp
     def verify_bsl_status(self):
         try:
@@ -298,6 +408,30 @@ class OadpConfigurationMixin:
     def _scenario_needs_kubevirt_plugin(scenario: dict) -> bool:
         """Return True when the scenario uses the kubevirt Velero plugin."""
         return scenario.get("args", {}).get("plugin") == PLUGIN_KUBEVIRT
+
+    @staticmethod
+    def _scenario_needs_kubevirt_datamover_plugin(scenario: dict) -> bool:
+        """Return True for CBT-enabled kubevirt VM scenarios (Flow2, ticket 028).
+
+        Two flows exist for ``plugin: kubevirt`` VM backups:
+
+        - Flow1 (no CBT / ``cbt: false``, e.g. TC 10.4): plain 'kubevirt' plugin
+          in the DPA's defaultPlugins is sufficient; ``exec_backup()`` already
+          runs a normal kubevirt-datamover backup (``--data-mover velero
+          --snapshot-move-data=true``).
+        - Flow2 (``cbt: true``, e.g. TC 10.5): the DPA additionally needs the
+          'kubevirt-datamover' plugin registered, plus a resource-policy
+          ConfigMap ('kubevirt-volume-policy') referenced on the backup CR —
+          otherwise the CSI snapshot policy conflicts with the datamover's own
+          snapshot handling of CBT-labeled volumes. This was observed live
+          during the TC 10.5 test as backup warnings: "PVC ... has snapshot
+          policy which conflicts with kubevirt datamover" (backup still
+          completed, but the warnings indicate the setup was incomplete).
+        """
+        if not OadpConfigurationMixin._scenario_needs_kubevirt_plugin(scenario):
+            return False
+        script_args = scenario.get("args", {}).get("vm_population_script_args", {})
+        return bool(script_args.get("cbt", False))
 
     @logger_time_stamp
     def validate_dpa_structure(self, oadp_namespace: str) -> bool:

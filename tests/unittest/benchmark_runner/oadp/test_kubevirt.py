@@ -13,13 +13,16 @@ from benchmark_runner.oadp.constants import (
     KNOWN_INCREMENT_LEVELS,
     KNOWN_PLUGINS,
     KNOWN_VM_POPULATION_METHODS,
+    KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
     MPQE_VM_SCRIPT_NS_SUFFIX,
     MPQE_VM_SCRIPTS_PATH,
+    PLUGIN_KUBEVIRT_DATAMOVER,
     SHELL_METACHARACTERS,
     VM_DATASET_ROLE,
     VM_DEFAULT_SSH_USER,
     VM_POPULATION_METHOD_SCRIPT,
 )
+from benchmark_runner.oadp.configuration import OadpConfigurationMixin
 from benchmark_runner.oadp.dataset import OadpDatasetMixin
 from benchmark_runner.oadp.execution import OadpExecutionMixin
 from benchmark_runner.oadp.scenario import OadpScenarioMixin, scenario_includes_kubevirt_dataset
@@ -160,7 +163,11 @@ class TestableDataset(OadpDatasetMixin, OadpVmOperationsMixin, OadpWorkloads):
     __test__ = False
 
 
-class TestableExecution(OadpExecutionMixin, OadpWorkloads):
+class TestableConfiguration(OadpConfigurationMixin, OadpWorkloads):
+    __test__ = False
+
+
+class TestableExecution(OadpExecutionMixin, OadpConfigurationMixin, OadpWorkloads):
     pass
 
 
@@ -1607,3 +1614,178 @@ class TestExecBackupPluginFlags:
         cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
         assert "--snapshot-move-data" not in cmd
         assert "--data-mover" not in cmd
+
+    # --- Flow2 (ticket 028): CBT-enabled kubevirt backups reference a resource-policy ConfigMap ---
+
+    def test_downstream_kubevirt_cbt_gets_resource_policy_flag(self, mx):
+        mx.exec_backup(
+            plugin="kubevirt",
+            backup_name="b1",
+            namespaces_to_backup="ns1",
+            resource_policy_configmap=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert f"--resource-policies-configmap {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}" in cmd
+        # still gets the base Flow1 datamover flags too
+        assert "--data-mover 'velero'" in cmd
+        assert "--snapshot-move-data=true" in cmd
+
+    def test_downstream_kubevirt_without_cbt_omits_resource_policy_flag(self, mx):
+        mx.exec_backup(plugin="kubevirt", backup_name="b1", namespaces_to_backup="ns1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--resource-policies-configmap" not in cmd
+
+    def test_downstream_non_kubevirt_ignores_resource_policy_configmap(self, mx):
+        # resource_policy_configmap only ever gets threaded to the kubevirt branch;
+        # confirm other plugins don't accidentally pick it up.
+        mx.exec_backup(
+            plugin="csi",
+            backup_name="b1",
+            namespaces_to_backup="ns1",
+            resource_policy_configmap=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--resource-policies-configmap" not in cmd
+
+
+# ===========================================================================
+# 24. Flow2 (ticket 028): CBT-enabled kubevirt backups need 'kubevirt-datamover'
+#     registered on the DPA and a 'kubevirt-volume-policy' resource-policy
+#     ConfigMap referenced on the backup CR.
+# ===========================================================================
+
+
+class TestScenarioNeedsKubevirtDatamoverPlugin:
+    def _cbt_scenario(self, cbt=True):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = cbt
+        return s
+
+    def test_true_for_cbt_enabled_kubevirt_scenario(self):
+        assert OadpConfigurationMixin._scenario_needs_kubevirt_datamover_plugin(self._cbt_scenario(True)) is True
+
+    def test_false_for_cbt_disabled_kubevirt_scenario(self):
+        assert OadpConfigurationMixin._scenario_needs_kubevirt_datamover_plugin(self._cbt_scenario(False)) is False
+
+    def test_false_when_cbt_key_absent(self):
+        s = self._cbt_scenario()
+        del s["args"]["vm_population_script_args"]["cbt"]
+        assert OadpConfigurationMixin._scenario_needs_kubevirt_datamover_plugin(s) is False
+
+    def test_false_for_non_kubevirt_plugin_even_with_cbt(self):
+        s = _script_kubevirt_scenario(
+            args=_valid_args(
+                plugin="csi",
+                vm_population_method="script",
+                vm_population_script_args={"vms": 2, "data_disks": 1, "cbt": True},
+            )
+        )
+        assert OadpConfigurationMixin._scenario_needs_kubevirt_datamover_plugin(s) is False
+
+
+class TestEnsureKubevirtDatamoverPlugin:
+    @pytest.fixture
+    def mx(self):
+        m = TestableConfiguration()
+        m._OadpWorkloads__oadp_dpa = "example-velero"
+        m.get_oc_resource_to_json = MagicMock(
+            return_value={"spec": {"configuration": {"velero": {"defaultPlugins": ["openshift", "csi", "kubevirt"]}}}}
+        )
+        m.patch_oc_resource = MagicMock()
+        return m
+
+    def _cbt_scenario(self):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = True
+        return s
+
+    def test_noop_when_scenario_does_not_need_it(self, mx):
+        result = mx.ensure_kubevirt_datamover_plugin(scenario=_script_kubevirt_scenario(), oadp_namespace="openshift-adp")
+        assert result is False
+        mx.patch_oc_resource.assert_not_called()
+
+    def test_noop_when_already_present(self, mx):
+        mx.get_oc_resource_to_json.return_value = {
+            "spec": {"configuration": {"velero": {"defaultPlugins": ["csi", "kubevirt", PLUGIN_KUBEVIRT_DATAMOVER]}}}
+        }
+        result = mx.ensure_kubevirt_datamover_plugin(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+        assert result is False
+        mx.patch_oc_resource.assert_not_called()
+
+    def test_patches_when_missing(self, mx):
+        result = mx.ensure_kubevirt_datamover_plugin(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+        assert result is True
+        mx.patch_oc_resource.assert_called_once()
+        call_kwargs = mx.patch_oc_resource.call_args.kwargs
+        assert call_kwargs["resource_type"] == "dpa"
+        assert call_kwargs["resource_name"] == "example-velero"
+        assert call_kwargs["namespace"] == "openshift-adp"
+        assert call_kwargs["patch_type"] == "json"
+        assert PLUGIN_KUBEVIRT_DATAMOVER in call_kwargs["patch_json"]
+        # existing plugins must be preserved, not clobbered
+        assert "kubevirt" in call_kwargs["patch_json"]
+        assert "csi" in call_kwargs["patch_json"]
+
+    def test_fails_test_run_when_dpa_missing(self, mx):
+        mx.get_oc_resource_to_json.return_value = {}
+        with pytest.raises(RuntimeError):
+            mx.ensure_kubevirt_datamover_plugin(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+
+
+class TestEnsureKubevirtVolumePolicyConfigMap:
+    @pytest.fixture
+    def mx(self):
+        m = TestableConfiguration()
+        m._OadpWorkloads__ssh.run.return_value = f"configmap/{KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME} created"
+        return m
+
+    def _cbt_scenario(self):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = True
+        return s
+
+    def test_noop_when_scenario_does_not_need_it(self, mx):
+        mx.ensure_kubevirt_volume_policy_configmap(scenario=_script_kubevirt_scenario(), oadp_namespace="openshift-adp")
+        mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_applies_manifest_when_needed(self, mx):
+        mx.ensure_kubevirt_volume_policy_configmap(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "oc apply -f -" in cmd
+        assert "kind: ConfigMap" in cmd
+        assert f"name: {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}" in cmd
+        assert "namespace: openshift-adp" in cmd
+        assert "type: skip" in cmd
+
+    def test_fails_test_run_when_apply_fails(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "Error from server (NotFound)"
+        with pytest.raises(RuntimeError):
+            mx.ensure_kubevirt_volume_policy_configmap(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+
+
+class TestOadpExecuteScenarioResourcePolicyWiring:
+    """Confirms oadp_execute_scenario() threads Flow2's resource_policy_configmap through to exec_backup()."""
+
+    @pytest.fixture
+    def mx(self):
+        m = TestableExecution()
+        m._OadpWorkloads__test_env["source"] = "downstream"
+        m.ds_get_all_namespaces = MagicMock(return_value=["ns1"])
+        m.exec_backup = MagicMock()
+        m.wait_for_condition_of_cr = MagicMock(return_value=True)
+        return m
+
+    def _scenario(self, cbt):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = cbt
+        return s
+
+    def test_cbt_scenario_passes_resource_policy_configmap(self, mx):
+        mx.oadp_execute_scenario(self._scenario(cbt=True), run_method="python")
+        call_kwargs = mx.exec_backup.call_args.kwargs
+        assert call_kwargs["resource_policy_configmap"] == KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME
+
+    def test_non_cbt_scenario_passes_none(self, mx):
+        mx.oadp_execute_scenario(self._scenario(cbt=False), run_method="python")
+        call_kwargs = mx.exec_backup.call_args.kwargs
+        assert call_kwargs["resource_policy_configmap"] is None
