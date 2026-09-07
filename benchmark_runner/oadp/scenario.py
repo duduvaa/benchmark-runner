@@ -38,6 +38,36 @@ def scenario_includes_kubevirt_dataset(scenario: dict) -> bool:
     return False
 
 
+def get_script_ns_count(scenario: dict) -> int:
+    """Return 'vm_population_script_args.ns' (ticket 029), default 1.
+
+    'ns' > 1 means VMsPopulation.sh populates 'ns' sibling namespaces with the
+    same VM/disk/CBT configuration instead of just one.
+    """
+    args = scenario.get("args", {})
+    if args.get("vm_population_method") != VM_POPULATION_METHOD_SCRIPT:
+        return 1
+    return int(args.get("vm_population_script_args", {}).get("ns", 1))
+
+
+def expand_multi_namespaces(namespace: str, ns_count: int) -> list:
+    """Expand a script-populated namespace ending in '-ns1' into the full sibling
+    namespace list VMsPopulation.sh creates for 'ns' > 1 (ticket 029).
+
+    A single ``VMsPopulation.sh -ns N -namespace <base>`` invocation creates N
+    sibling namespaces named ``<base>-ns1`` through ``<base>-nsN``. The
+    scenario's ``namespaces_to_backup``/dataset namespace conventionally
+    already carries the ``-ns1`` suffix (ticket 019); this reconstructs
+    ``<base>`` and returns all N sibling names in order. ``ns_count <= 1``
+    returns ``[namespace]`` unchanged, preserving today's single-namespace
+    behavior exactly.
+    """
+    if ns_count <= 1:
+        return [namespace]
+    base = namespace[: -len(MPQE_VM_SCRIPT_NS_SUFFIX)] if namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX) else namespace
+    return [f"{base}-ns{i}" for i in range(1, ns_count + 1)]
+
+
 class OadpScenarioMixin:
     """Scenario YAML loading, validation, dataset helpers, index generation."""
 
@@ -192,7 +222,9 @@ class OadpScenarioMixin:
         Defaults to the native Python pipeline when 'vm_population_method' is
         absent. When set to 'script', requires 'vm_population_script_args'
         with 'vms' (positive int) and 'data_disks' (non-negative int; 0 means
-        OS disk only), and validates the optional 'cbt' boolean flag.
+        OS disk only), and validates the optional 'cbt' boolean flag and the
+        optional 'ns' positive-int flag (number of sibling namespaces to
+        populate, default 1 — ticket 029).
         """
         method = args.get("vm_population_method", VM_POPULATION_METHOD_NATIVE)
         if method not in KNOWN_VM_POPULATION_METHODS:
@@ -231,6 +263,11 @@ class OadpScenarioMixin:
         cbt = script_args.get("cbt", False)
         if not isinstance(cbt, bool):
             logger.error(f"Error: vm_population_script_args.cbt must be a boolean, got {cbt!r}")
+            return False
+
+        ns = script_args.get("ns", 1)
+        if not isinstance(ns, int) or isinstance(ns, bool) or ns < 1:
+            logger.error(f"Error: vm_population_script_args.ns must be a positive integer, got {ns!r}")
             return False
 
         for key, value in script_args.items():
@@ -275,6 +312,10 @@ class OadpScenarioMixin:
         multi-NS loop always appends '-ns<i>', even at -ns 1). The scenario's
         effective namespace must already carry that suffix so vm_operations can
         strip it and reconstruct the exact base name the script expects.
+
+        When 'vm_population_script_args.ns' > 1 (ticket 029), the scenario
+        still only names the first sibling namespace ('<base>-ns1') here —
+        ``expand_multi_namespaces()`` reconstructs the rest.
         """
         dataset_value = scenario.get("dataset")
         namespace = ""
@@ -354,21 +395,28 @@ class OadpScenarioMixin:
                 self._OadpWorkloads__scenario_datasets = all_datasets
                 self.print_all_ds(scenario)
             elif isinstance(scenario["dataset"], dict):
-                namespace = scenario["args"].get("namespaces_to_backup", "")
+                base_namespace = scenario["args"].get("namespaces_to_backup", "")
                 ds_dict = scenario["dataset"]
-                summary = {
-                    "namespace": namespace,
-                    "total_datasets_for_this_namespace": 1,
-                    "total_pods_per_all_datasets_with_same_namespace": ds_dict.get(
-                        "pods_per_ns", ds_dict.get("vms_per_namespace", 0)
-                    ),
-                    "list_of_datasets_which_belong_to_this_namespace": [
-                        self._process_dataset(dataset=ds_dict, namespace=namespace)
-                    ],
-                    "all_ds_exists": False,
-                    "all_ds_validated": False,
-                }
-                all_datasets.append(summary)
+                ns_count = get_script_ns_count(scenario)
+                # ticket 029: 'ns' > 1 populates several sibling namespaces
+                # ('<base>-ns1'..'<base>-nsN') with identical dataset config.
+                # Each gets its own summary entry so ds_get_all_namespaces()
+                # (and everything built on it: backup --include-namespaces,
+                # VM validation, incremental data) naturally covers all of them.
+                for namespace in expand_multi_namespaces(base_namespace, ns_count):
+                    summary = {
+                        "namespace": namespace,
+                        "total_datasets_for_this_namespace": 1,
+                        "total_pods_per_all_datasets_with_same_namespace": ds_dict.get(
+                            "pods_per_ns", ds_dict.get("vms_per_namespace", 0)
+                        ),
+                        "list_of_datasets_which_belong_to_this_namespace": [
+                            self._process_dataset(dataset=ds_dict, namespace=namespace)
+                        ],
+                        "all_ds_exists": False,
+                        "all_ds_validated": False,
+                    }
+                    all_datasets.append(summary)
                 self._OadpWorkloads__scenario_datasets = all_datasets
                 self.print_all_ds(scenario)
         except Exception as err:
@@ -520,12 +568,15 @@ class OadpScenarioMixin:
 
         elif isinstance(dataset_value, dict):
             ds_dict = test_scenario["dataset"]
-            namespace = test_scenario["args"]["namespaces_to_backup"]
             expected_capacity = ds_dict.get("expected_capacity", "0K")
             asset_count = ds_dict.get("pods_per_ns", ds_dict.get("vms_per_namespace", 0))
             value, unit = self._parse_capacity(expected_capacity)
             value = self._convert_to_mb(value, unit)
-            ns_capacities[namespace] = value * asset_count
+            # ticket 029: cover every sibling namespace ('ns' > 1), not just
+            # the single 'namespaces_to_backup' value — each sibling holds an
+            # identical copy of the dataset.
+            for namespace in self.ds_get_all_namespaces():
+                ns_capacities[namespace] = value * asset_count
 
             total_data = sum(ns_capacities.values())
             ns_capacities["total_data_in_mb"] = total_data

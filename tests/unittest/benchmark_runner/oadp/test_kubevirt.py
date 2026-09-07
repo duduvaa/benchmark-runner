@@ -25,7 +25,12 @@ from benchmark_runner.oadp.constants import (
 from benchmark_runner.oadp.configuration import OadpConfigurationMixin
 from benchmark_runner.oadp.dataset import OadpDatasetMixin
 from benchmark_runner.oadp.execution import OadpExecutionMixin
-from benchmark_runner.oadp.scenario import OadpScenarioMixin, scenario_includes_kubevirt_dataset
+from benchmark_runner.oadp.scenario import (
+    OadpScenarioMixin,
+    expand_multi_namespaces,
+    get_script_ns_count,
+    scenario_includes_kubevirt_dataset,
+)
 from benchmark_runner.oadp.vm_operations import OadpVmOperationsMixin
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
 from benchmark_runner.oadp.vm_validation import OadpVmValidationMixin
@@ -71,8 +76,21 @@ def _script_kubevirt_scenario(**overrides):
     s = _kubevirt_scenario()
     s["dataset"]["namespace"] = "kubevirt-script-2vm-1data-ns1"
     s["args"] = _valid_args(
+        namespaces_to_backup="kubevirt-script-2vm-1data-ns1",
         vm_population_method="script",
         vm_population_script_args={"vms": 2, "data_disks": 1, "cbt": False},
+    )
+    s.update(overrides)
+    return s
+
+
+def _multi_ns_script_scenario(ns_count=3, base="kubevirt-script-2vm-1data-rbd", **overrides):
+    """Script-populated kubevirt scenario spanning 'ns_count' sibling namespaces (ticket 029)."""
+    s = _kubevirt_scenario()
+    s["args"] = _valid_args(
+        namespaces_to_backup=f"{base}-ns1",
+        vm_population_method="script",
+        vm_population_script_args={"vms": 2, "data_disks": 1, "cbt": False, "ns": ns_count},
     )
     s.update(overrides)
     return s
@@ -1789,3 +1807,243 @@ class TestOadpExecuteScenarioResourcePolicyWiring:
         mx.oadp_execute_scenario(self._scenario(cbt=False), run_method="python")
         call_kwargs = mx.exec_backup.call_args.kwargs
         assert call_kwargs["resource_policy_configmap"] is None
+
+
+# ===========================================================================
+# 29. Multi-namespace population/backup support (ticket 029)
+#
+# vm_population_script_args.ns > 1 means a single dict-form kubevirt dataset
+# actually spans N sibling namespaces ('<base>-ns1'..'<base>-nsN'), all
+# populated by one VMsPopulation.sh '-ns N' invocation. Backup must then
+# --include-namespaces all of them, for both Flow1 (no CBT) and Flow2 (CBT).
+# ===========================================================================
+
+
+class TestGetScriptNsCount:
+    def test_defaults_to_one_when_absent(self):
+        s = _script_kubevirt_scenario()
+        assert "ns" not in s["args"]["vm_population_script_args"]
+        assert get_script_ns_count(s) == 1
+
+    def test_reads_ns_from_script_args(self):
+        s = _multi_ns_script_scenario(ns_count=3)
+        assert get_script_ns_count(s) == 3
+
+    def test_one_when_native_population_method(self):
+        s = _kubevirt_scenario()
+        assert get_script_ns_count(s) == 1
+
+    def test_one_when_native_method_even_if_ns_key_present(self):
+        """'ns' is only meaningful for vm_population_method 'script'."""
+        s = _kubevirt_scenario(args=_valid_args(vm_population_script_args={"ns": 5}))
+        assert get_script_ns_count(s) == 1
+
+
+class TestExpandMultiNamespaces:
+    def test_ns_count_one_returns_namespace_unchanged(self):
+        assert expand_multi_namespaces("base-ns1", 1) == ["base-ns1"]
+
+    def test_ns_count_one_is_default_safe_even_without_suffix(self):
+        assert expand_multi_namespaces("kubevirt-minimal-ns", 1) == ["kubevirt-minimal-ns"]
+
+    def test_expands_three_sibling_namespaces_in_order(self):
+        assert expand_multi_namespaces("rhel9-oadp-2vms-1os-1data-rbd-ns1", 3) == [
+            "rhel9-oadp-2vms-1os-1data-rbd-ns1",
+            "rhel9-oadp-2vms-1os-1data-rbd-ns2",
+            "rhel9-oadp-2vms-1os-1data-rbd-ns3",
+        ]
+
+    def test_namespace_without_ns1_suffix_still_expands_from_whole_string(self):
+        """Defensive: validation should already guarantee the '-ns1' suffix, but if it's
+        somehow missing, expansion still produces N deterministic, distinct names."""
+        assert expand_multi_namespaces("kubevirt-minimal-ns", 2) == [
+            "kubevirt-minimal-ns-ns1",
+            "kubevirt-minimal-ns-ns2",
+        ]
+
+
+class TestVmPopulationNsArgValidation:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_ns_absent_defaults_valid(self, mx):
+        s = _script_kubevirt_scenario()
+        assert "ns" not in s["args"]["vm_population_script_args"]
+        assert mx.validate_scenario(s) is True
+
+    def test_ns_three_is_valid(self, mx):
+        assert mx.validate_scenario(_multi_ns_script_scenario(ns_count=3)) is True
+
+    @pytest.mark.parametrize("ns", [0, -1, "3", 2.5, True])
+    def test_bad_ns_rejected(self, mx, ns):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["ns"] = ns
+        assert mx.validate_scenario(s) is False
+
+
+class TestLoadDatasetsForScenarioMultiNamespace:
+    @pytest.fixture
+    def mx(self):
+        obj = TestableScenario()
+        obj.print_all_ds = MagicMock()
+        return obj
+
+    def test_single_namespace_unchanged_when_ns_absent(self, mx):
+        scenario = _script_kubevirt_scenario()
+        mx.load_datasets_for_scenario(scenario)
+        assert mx.ds_get_all_namespaces() == ["kubevirt-script-2vm-1data-ns1"]
+
+    def test_expands_into_n_namespace_summaries(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx.load_datasets_for_scenario(scenario)
+        assert mx.ds_get_all_namespaces() == [
+            "kubevirt-script-2vm-1data-rbd-ns1",
+            "kubevirt-script-2vm-1data-rbd-ns2",
+            "kubevirt-script-2vm-1data-rbd-ns3",
+        ]
+
+    def test_each_sibling_namespace_carries_the_same_dataset_config(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=2)
+        mx.load_datasets_for_scenario(scenario)
+        for ns in mx.ds_get_all_namespaces():
+            datasets = mx.ds_get_datasets_for_namespace(ns)
+            assert len(datasets) == 1
+            assert datasets[0]["namespace"] == ns
+            assert datasets[0]["vm_profile"] == scenario["dataset"]["vm_profile"]
+            assert datasets[0]["vms_per_namespace"] == scenario["dataset"]["vms_per_namespace"]
+
+    def test_non_script_kubevirt_scenario_unaffected(self, mx):
+        """Native (non-script) kubevirt population is unaffected by 'ns' logic."""
+        scenario = _kubevirt_scenario(args=_valid_args(namespaces_to_backup="kubevirt-minimal-ns"))
+        mx.load_datasets_for_scenario(scenario)
+        assert mx.ds_get_all_namespaces() == ["kubevirt-minimal-ns"]
+
+
+class TestValidateExpectedVmDatasetsMultiNamespace:
+    @pytest.fixture
+    def mx(self):
+        obj = TestableVmValidation()
+        obj._check_vm_count = MagicMock(return_value=True)
+        obj._check_all_vmis_running = MagicMock(return_value=True)
+        obj.verify_vm_data_via_script = MagicMock(return_value=True)
+        return obj
+
+    def test_validates_every_sibling_namespace(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        assert mx.validate_expected_vm_datasets(scenario) is True
+        checked_namespaces = [call.args[0] for call in mx._check_vm_count.call_args_list]
+        assert checked_namespaces == [
+            "kubevirt-script-2vm-1data-rbd-ns1",
+            "kubevirt-script-2vm-1data-rbd-ns2",
+            "kubevirt-script-2vm-1data-rbd-ns3",
+        ]
+
+    def test_reports_only_failing_siblings(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        # ns2 fails VM-count check, ns1 and ns3 pass.
+        mx._check_vm_count = MagicMock(side_effect=[True, False, True])
+        result = mx.validate_expected_vm_datasets(scenario)
+        assert result is False
+        failing_namespaces = [ds["namespace"] for ds in mx._OadpWorkloads__oadp_ds_failing_validation]
+        assert failing_namespaces == ["kubevirt-script-2vm-1data-rbd-ns2"]
+
+    def test_single_namespace_behavior_unchanged_when_ns_absent(self, mx):
+        scenario = _script_kubevirt_scenario()
+        assert mx.validate_expected_vm_datasets(scenario) is True
+        mx._check_vm_count.assert_called_once_with("kubevirt-script-2vm-1data-ns1", 2)
+
+    def test_native_population_method_unaffected_by_ns_expansion(self, mx):
+        """'ns' only applies to vm_population_method 'script'; native scenarios validate
+        exactly one namespace, same as before this ticket (data-level checks aside)."""
+        scenario = _kubevirt_scenario(args=_valid_args(namespaces_to_backup="kubevirt-minimal-ns"))
+        mx.validate_expected_vm_datasets(scenario)
+        mx._check_vm_count.assert_called_once_with("kubevirt-minimal-ns", 2)
+        mx._check_all_vmis_running.assert_called_once_with("kubevirt-minimal-ns", 2)
+
+
+class TestCreateVmDatasetViaScriptMultiNamespaceGroup:
+    @pytest.fixture
+    def mx(self):
+        m = TestableVmOps()
+        m._OadpWorkloads__ssh.run.return_value = "MPQE_SCRIPT_EXIT_CODE:0"
+        return m
+
+    def test_ns1_leader_runs_script_with_full_ns_count(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-rbd-ns1"})
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-ns 3" in cmd
+        assert "-namespace kubevirt-script-2vm-1data-rbd" in cmd
+
+    def test_ns2_sibling_does_not_invoke_script(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-rbd-ns2"})
+        mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_ns3_sibling_does_not_invoke_script(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-rbd-ns3"})
+        mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_sibling_still_records_its_own_cbt_state(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.check_cbt_state = MagicMock(return_value={"vm-0": {"state": "Enabled", "label": "true"}})
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-rbd-ns2"})
+        mx.check_cbt_state.assert_called_once_with("kubevirt-script-2vm-1data-rbd-ns2")
+        assert mx._OadpWorkloads__run_metadata["summary"]["validations"]["cbt_state"][
+            "kubevirt-script-2vm-1data-rbd-ns2"
+        ] == {"vm-0": {"state": "Enabled", "label": "true"}}
+
+    def test_single_namespace_behavior_unchanged_when_ns_absent(self, mx):
+        """ns defaults to 1 -> namespace always ends in '-ns1' -> always the leader (today's behavior)."""
+        scenario = _script_kubevirt_scenario()
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-ns1"})
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "-ns 1" in cmd
+
+
+class TestOadpExecuteScenarioMultiNamespaceIncludeNamespaces:
+    """Confirms the backup CR's --include-namespaces covers every sibling namespace,
+    for both Flow1 (no CBT) and Flow2 (CBT) — achieved via ds_get_all_namespaces()."""
+
+    @pytest.fixture
+    def mx(self):
+        m = TestableExecution()
+        m._OadpWorkloads__test_env["source"] = "downstream"
+        m.exec_backup = MagicMock()
+        m.wait_for_condition_of_cr = MagicMock(return_value=True)
+        return m
+
+    def test_flow1_no_cbt_includes_all_sibling_namespaces(self, mx):
+        mx.ds_get_all_namespaces = MagicMock(
+            return_value=[
+                "rhel9-oadp-2vms-1os-1data-rbd-ns1",
+                "rhel9-oadp-2vms-1os-1data-rbd-ns2",
+                "rhel9-oadp-2vms-1os-1data-rbd-ns3",
+            ]
+        )
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx.oadp_execute_scenario(scenario, run_method="python")
+        call_kwargs = mx.exec_backup.call_args.kwargs
+        assert call_kwargs["namespaces_to_backup"] == (
+            "rhel9-oadp-2vms-1os-1data-rbd-ns1,rhel9-oadp-2vms-1os-1data-rbd-ns2,rhel9-oadp-2vms-1os-1data-rbd-ns3"
+        )
+        assert call_kwargs["resource_policy_configmap"] is None
+
+    def test_flow2_cbt_includes_all_sibling_namespaces_and_resource_policy(self, mx):
+        mx.ds_get_all_namespaces = MagicMock(
+            return_value=[
+                "rhel9-oadp-2vms-1os-1data-cbt-rbd-ns1",
+                "rhel9-oadp-2vms-1os-1data-cbt-rbd-ns2",
+            ]
+        )
+        scenario = _multi_ns_script_scenario(ns_count=2, base="rhel9-oadp-2vms-1os-1data-cbt-rbd")
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.oadp_execute_scenario(scenario, run_method="python")
+        call_kwargs = mx.exec_backup.call_args.kwargs
+        assert call_kwargs["namespaces_to_backup"] == (
+            "rhel9-oadp-2vms-1os-1data-cbt-rbd-ns1,rhel9-oadp-2vms-1os-1data-cbt-rbd-ns2"
+        )
+        assert call_kwargs["resource_policy_configmap"] == KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME

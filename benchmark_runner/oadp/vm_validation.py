@@ -24,6 +24,7 @@ from benchmark_runner.oadp.constants import (
     VM_DEFAULT_SSH_USER,
     VM_POPULATION_METHOD_SCRIPT,
 )
+from benchmark_runner.oadp.scenario import expand_multi_namespaces, get_script_ns_count
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
 
 
@@ -85,7 +86,16 @@ class OadpVmValidationMixin:
             elif isinstance(dataset_value, dict):
                 if dataset_value.get("role") != VM_DATASET_ROLE:
                     return True
-                datasets = [dataset_value]
+                # ticket 029: 'vm_population_script_args.ns' > 1 means this
+                # single dict dataset actually spans N sibling namespaces
+                # ('<base>-ns1'..'<base>-nsN') — validate (and, if missing,
+                # recreate) every one of them, not just the first.
+                base_namespace = scenario["args"].get("namespaces_to_backup", "")
+                ns_count = get_script_ns_count(scenario)
+                datasets = [
+                    {**dataset_value, "namespace": ns}
+                    for ns in expand_multi_namespaces(base_namespace, ns_count)
+                ]
             else:
                 return True
 

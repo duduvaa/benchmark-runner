@@ -186,27 +186,46 @@ class OadpVmOperationsMixin:
         ``vm_population_method: script``. Blocks until the script completes —
         it internally waits for VMs to boot, populates baseline data, and
         (optionally) enables CBT before returning.
+
+        Multi-namespace groups (``vm_population_script_args.ns`` > 1, ticket
+        029): a single ``VMsPopulation.sh -ns N`` invocation creates every
+        sibling namespace ('<base>-ns1'..'<base>-nsN') at once — there is no
+        way to ask the script to create just one sibling on its own. So this
+        method only actually runs the script when ``ds`` is the group's
+        '-ns1' member (the "leader"); it's called once per sibling namespace
+        by ``verify_vm_datasets_before_backups()``, and the non-leader calls
+        are no-ops beyond recording their own CBT state.
         """
         namespace = ds["namespace"]
         script_args = scenario["args"].get("vm_population_script_args", {})
         vms = int(script_args.get("vms", 1))
         data_disks = int(script_args.get("data_disks", 1))
         cbt = bool(script_args.get("cbt", False))
+        ns_count = int(script_args.get("ns", 1))
         namespace_base = self._mpqe_namespace_base(namespace)
+        is_group_leader = namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX)
 
-        cmd = (
-            f"{MPQE_VM_SCRIPTS_PATH}/VMsPopulation.sh "
-            f"-vms {vms} -disks {data_disks} -ns 1 -namespace {namespace_base}"
-        )
-        if cbt:
-            cmd += " -cbt"
+        if is_group_leader:
+            cmd = (
+                f"{MPQE_VM_SCRIPTS_PATH}/VMsPopulation.sh "
+                f"-vms {vms} -disks {data_disks} -ns {ns_count} -namespace {namespace_base}"
+            )
+            if cbt:
+                cmd += " -cbt"
 
-        self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script")
-        self._run_vm_script(
-            cmd,
-            f"VMsPopulation.sh (namespace={namespace}, vms={vms}, data_disks={data_disks}, cbt={cbt})",
-        )
-        self.oadp_timer(action="stop", transaction_name="vm_dataset_creation_script")
+            self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script")
+            self._run_vm_script(
+                cmd,
+                f"VMsPopulation.sh (namespace={namespace_base}, vms={vms}, data_disks={data_disks}, "
+                f"cbt={cbt}, ns_count={ns_count})",
+            )
+            self.oadp_timer(action="stop", transaction_name="vm_dataset_creation_script")
+        else:
+            logger.info(
+                f"create_vm_dataset_via_script: {namespace} is a sibling in a {ns_count}-namespace "
+                f"group already created by the '-ns1' member's single VMsPopulation.sh invocation "
+                f"— skipping a redundant script call."
+            )
 
         if cbt:
             cbt_state = self.check_cbt_state(namespace)
