@@ -335,12 +335,27 @@ class OadpConfigurationMixin:
         No-op unless the scenario is CBT-enabled kubevirt (see
         ``_scenario_needs_kubevirt_datamover_plugin``). Referenced by
         ``exec_backup()`` via ``--resource-policies-configmap`` on CBT-enabled
-        kubevirt backups so Velero skips its own CSI-snapshot volume handling
-        for CBT-labeled volumes and lets the kubevirt-datamover plugin manage
-        them instead. ``oc apply`` is idempotent, so this is safe to call
-        unconditionally every run.
+        kubevirt backups so Velero routes matching volumes through the
+        kubevirt datamover (``action.type: custom``, ``datamover: kubevirt``)
+        instead of its own CSI-snapshot handling.
+
+        If the ConfigMap is already present, it is left untouched — do not
+        overwrite a cluster-managed or previously applied policy.
         """
         if not self._scenario_needs_kubevirt_datamover_plugin(scenario):
+            return
+
+        existing = self.get_oc_resource_to_json(
+            resource_type="configmap",
+            resource_name=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+            namespace=oadp_namespace,
+        )
+        if existing:
+            logger.info(
+                f"### INFO ### ensure_kubevirt_volume_policy_configmap: "
+                f"'{KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}' already present in "
+                f"{oadp_namespace}; leaving it unchanged"
+            )
             return
 
         manifest = (
@@ -355,16 +370,17 @@ class OadpConfigurationMixin:
             "    volumePolicies:\n"
             "      - conditions: {}\n"
             "        action:\n"
-            "          type: skip\n"
+            "          type: custom\n"
+            "          parameters:\n"
+            "            datamover: kubevirt\n"
         )
-        result = self._OadpWorkloads__ssh.run(cmd=f"cat <<'EOF' | oc apply -f -\n{manifest}EOF")
-        expected_result_output = ["created", "unchanged", "configured"]
-        if not any(ext in result for ext in expected_result_output):
+        result = self._OadpWorkloads__ssh.run(cmd=f"cat <<'EOF' | oc create -f -\n{manifest}EOF")
+        if "created" not in result:
             logger.error(
-                f":: ERROR :: ensure_kubevirt_volume_policy_configmap: apply failed for "
+                f":: ERROR :: ensure_kubevirt_volume_policy_configmap: create failed for "
                 f"'{KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}' in {oadp_namespace}: {result}"
             )
-            self.fail_test_run(f"Unable to apply {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME} ConfigMap")
+            self.fail_test_run(f"Unable to create {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME} ConfigMap")
         else:
             logger.info(f":: INFO :: ensure_kubevirt_volume_policy_configmap: {result}")
 

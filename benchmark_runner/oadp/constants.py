@@ -122,10 +122,11 @@ PLUGIN_KUBEVIRT_DATAMOVER = "kubevirt-datamover"
 
 # Resource-policy ConfigMap referenced by CBT-enabled kubevirt backups (Flow2,
 # ticket 028) via `velero backup create --resource-policies-configmap` /
-# `spec.resourcePolicy` on the backup CR. Tells Velero to skip its own
-# CSI-snapshot volume handling so the kubevirt-datamover plugin manages the
-# CBT-labeled volumes instead, avoiding "PVC ... has snapshot policy which
-# conflicts with kubevirt datamover" backup warnings.
+# `spec.resourcePolicy` on the backup CR. Policy action is
+# `type: custom` / `datamover: kubevirt` so matching volumes are routed
+# through the kubevirt datamover instead of Velero's CSI-snapshot handling,
+# avoiding "PVC ... has snapshot policy which conflicts with kubevirt
+# datamover" backup warnings.
 KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME = "kubevirt-volume-policy"
 
 # ---------------------------------------------------------------------------

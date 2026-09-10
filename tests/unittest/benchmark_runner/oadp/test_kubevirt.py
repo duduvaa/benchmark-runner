@@ -1754,6 +1754,7 @@ class TestEnsureKubevirtVolumePolicyConfigMap:
     @pytest.fixture
     def mx(self):
         m = TestableConfiguration()
+        m.get_oc_resource_to_json = MagicMock(return_value={})
         m._OadpWorkloads__ssh.run.return_value = f"configmap/{KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME} created"
         return m
 
@@ -1764,19 +1765,34 @@ class TestEnsureKubevirtVolumePolicyConfigMap:
 
     def test_noop_when_scenario_does_not_need_it(self, mx):
         mx.ensure_kubevirt_volume_policy_configmap(scenario=_script_kubevirt_scenario(), oadp_namespace="openshift-adp")
+        mx.get_oc_resource_to_json.assert_not_called()
         mx._OadpWorkloads__ssh.run.assert_not_called()
 
-    def test_applies_manifest_when_needed(self, mx):
+    def test_skips_create_when_configmap_already_exists(self, mx):
+        mx.get_oc_resource_to_json.return_value = {
+            "metadata": {"name": KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME, "namespace": "openshift-adp"}
+        }
+        mx.ensure_kubevirt_volume_policy_configmap(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
+        mx.get_oc_resource_to_json.assert_called_once_with(
+            resource_type="configmap",
+            resource_name=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+            namespace="openshift-adp",
+        )
+        mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_creates_manifest_when_missing(self, mx):
         mx.ensure_kubevirt_volume_policy_configmap(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
         cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
-        assert "oc apply -f -" in cmd
+        assert "oc create -f -" in cmd
         assert "kind: ConfigMap" in cmd
         assert f"name: {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}" in cmd
         assert "namespace: openshift-adp" in cmd
-        assert "type: skip" in cmd
+        assert "type: custom" in cmd
+        assert "datamover: kubevirt" in cmd
+        assert "type: skip" not in cmd
 
-    def test_fails_test_run_when_apply_fails(self, mx):
-        mx._OadpWorkloads__ssh.run.return_value = "Error from server (NotFound)"
+    def test_fails_test_run_when_create_fails(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = "Error from server (Forbidden)"
         with pytest.raises(RuntimeError):
             mx.ensure_kubevirt_volume_policy_configmap(scenario=self._cbt_scenario(), oadp_namespace="openshift-adp")
 
