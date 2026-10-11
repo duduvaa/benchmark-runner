@@ -24,7 +24,7 @@ from benchmark_runner.oadp.constants import (
     PLUGIN_VBD,
     SOURCE_UPSTREAM,
 )
-from benchmark_runner.oadp.scenario import scenario_includes_kubevirt_dataset
+from benchmark_runner.oadp.scenario import scenario_backup_namespaces, scenario_includes_kubevirt_dataset
 
 
 class OadpLogCollectionMixin:
@@ -237,11 +237,11 @@ class OadpLogCollectionMixin:
 
     @logger_time_stamp
     def collect_pod_distribution(self, logs_folder: str, scenario: dict) -> None:
-        """Record running-pod counts per worker node for the backup namespace."""
+        """Record running-pod counts per worker node for each backup namespace."""
         try:
             ssh = self._OadpWorkloads__ssh
-            cr_namespace = scenario["args"].get("namespaces_to_backup", "")
-            if not cr_namespace:
+            namespaces = scenario_backup_namespaces(scenario)
+            if not namespaces:
                 logger.warning("No namespaces_to_backup in scenario, skipping pod distribution")
                 return
 
@@ -258,29 +258,31 @@ class OadpLogCollectionMixin:
 
             lines = [
                 f"Pod distribution on all worker nodes for cluster: {cluster_info.strip()}",
-                f"For namespace: {cr_namespace}",
+                f"For namespaces: {', '.join(namespaces)}",
                 "As follows:",
             ]
             total_running = 0
-            node_num = 1
 
-            for node in worker_nodes.strip().splitlines():
-                node = node.strip()
-                if not node:
-                    continue
-                count_str = ssh.run(
-                    cmd=f"oc get pod -n {cr_namespace} "
-                    f"--field-selector=spec.nodeName={node} "
-                    f"--no-headers --ignore-not-found=true 2>/dev/null "
-                    f"| grep -c Running"
-                )
-                try:
-                    count = int(count_str.strip())
-                except (ValueError, AttributeError):
-                    count = 0
-                lines.append(f"worker node-{node_num}: {node} has {count} running pods")
-                total_running += count
-                node_num += 1
+            for cr_namespace in namespaces:
+                lines.append(f"--- namespace: {cr_namespace} ---")
+                node_num = 1
+                for node in worker_nodes.strip().splitlines():
+                    node = node.strip()
+                    if not node:
+                        continue
+                    count_str = ssh.run(
+                        cmd=f"oc get pod -n {cr_namespace} "
+                        f"--field-selector=spec.nodeName={node} "
+                        f"--no-headers --ignore-not-found=true 2>/dev/null "
+                        f"| grep -c Running"
+                    )
+                    try:
+                        count = int(count_str.strip())
+                    except (ValueError, AttributeError):
+                        count = 0
+                    lines.append(f"worker node-{node_num}: {node} has {count} running pods")
+                    total_running += count
+                    node_num += 1
 
             lines.append("===========================================")
             lines.append(f"Total running pods on all worker nodes: {total_running}")
@@ -401,62 +403,95 @@ class OadpLogCollectionMixin:
     # KubeVirt VM artifact collectors
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _multi_ns_artifact_name(basename: str, namespace: str, namespaces: list) -> str:
+        """Keep single-NS filenames unchanged; suffix with namespace when ns > 1."""
+        if len(namespaces) <= 1:
+            return basename
+        stem, _, ext = basename.rpartition(".")
+        if not stem:
+            return f"{basename}_{namespace}"
+        return f"{stem}_{namespace}.{ext}"
+
     @logger_time_stamp
     def collect_vm_describe(self, logs_folder: str, scenario: dict) -> None:
-        """Collect ``oc describe vm`` for every VM in the backup namespace."""
+        """Collect ``oc describe vm`` for every VM in each backup namespace."""
         try:
-            namespace = scenario["args"].get("namespaces_to_backup", "")
-            if not namespace:
+            namespaces = scenario_backup_namespaces(scenario)
+            if not namespaces:
                 return
             ssh = self._OadpWorkloads__ssh
             vm_dir = os.path.join(logs_folder, "VirtualMachines")
             os.makedirs(vm_dir, exist_ok=True)
-            vm_list = ssh.run(cmd=f'oc get vm -n {namespace} --no-headers -o custom-columns=":metadata.name" 2>/dev/null')
-            if not vm_list.strip():
-                return
-            for vm_name in vm_list.strip().splitlines():
-                vm_name = vm_name.strip()
-                if vm_name:
-                    out_file = os.path.join(vm_dir, f"{vm_name}-describe.txt")
+            for namespace in namespaces:
+                vm_list = ssh.run(
+                    cmd=f'oc get vm -n {namespace} --no-headers -o custom-columns=":metadata.name" 2>/dev/null'
+                )
+                if not vm_list.strip():
+                    continue
+                for vm_name in vm_list.strip().splitlines():
+                    vm_name = vm_name.strip()
+                    if not vm_name:
+                        continue
+                    # Prefix with namespace when multi-NS so sibling VM names don't collide.
+                    out_name = (
+                        f"{vm_name}-describe.txt"
+                        if len(namespaces) == 1
+                        else f"{namespace}-{vm_name}-describe.txt"
+                    )
+                    out_file = os.path.join(vm_dir, out_name)
                     ssh.run(cmd=f"oc describe vm {vm_name} -n {namespace} > {out_file} 2>&1")
         except Exception as err:
             logger.warning(f"collect_vm_describe failed: {err}")
 
     @logger_time_stamp
     def collect_dv_status(self, logs_folder: str, scenario: dict) -> None:
-        """Collect DataVolume status for the backup namespace."""
+        """Collect DataVolume status for each backup namespace."""
         try:
-            namespace = scenario["args"].get("namespaces_to_backup", "")
-            if not namespace:
+            namespaces = scenario_backup_namespaces(scenario)
+            if not namespaces:
                 return
-            dv_file = os.path.join(logs_folder, "datavolumes_status.yaml")
-            self._OadpWorkloads__ssh.run(cmd=f"oc get dv -n {namespace} -o yaml > {dv_file} 2>&1")
+            for namespace in namespaces:
+                dv_file = os.path.join(
+                    logs_folder,
+                    self._multi_ns_artifact_name("datavolumes_status.yaml", namespace, namespaces),
+                )
+                self._OadpWorkloads__ssh.run(cmd=f"oc get dv -n {namespace} -o yaml > {dv_file} 2>&1")
         except Exception as err:
             logger.warning(f"collect_dv_status failed: {err}")
 
     @logger_time_stamp
     def collect_vm_events(self, logs_folder: str, scenario: dict) -> None:
-        """Collect events from the backup namespace filtered for VM resources."""
+        """Collect events from each backup namespace filtered for VM resources."""
         try:
-            namespace = scenario["args"].get("namespaces_to_backup", "")
-            if not namespace:
+            namespaces = scenario_backup_namespaces(scenario)
+            if not namespaces:
                 return
-            events_file = os.path.join(logs_folder, "vm_events.txt")
-            self._OadpWorkloads__ssh.run(
-                cmd=f"oc get events -n {namespace} --sort-by=.metadata.creationTimestamp -o wide > {events_file} 2>&1"
-            )
+            for namespace in namespaces:
+                events_file = os.path.join(
+                    logs_folder,
+                    self._multi_ns_artifact_name("vm_events.txt", namespace, namespaces),
+                )
+                self._OadpWorkloads__ssh.run(
+                    cmd=f"oc get events -n {namespace} --sort-by=.metadata.creationTimestamp "
+                    f"-o wide > {events_file} 2>&1"
+                )
         except Exception as err:
             logger.warning(f"collect_vm_events failed: {err}")
 
     @logger_time_stamp
     def collect_vm_pvc_status(self, logs_folder: str, scenario: dict) -> None:
-        """Collect PVC status for the backup namespace (VM-associated PVCs)."""
+        """Collect PVC status for each backup namespace (VM-associated PVCs)."""
         try:
-            namespace = scenario["args"].get("namespaces_to_backup", "")
-            if not namespace:
+            namespaces = scenario_backup_namespaces(scenario)
+            if not namespaces:
                 return
-            pvc_file = os.path.join(logs_folder, "vm_pvc_status.yaml")
-            self._OadpWorkloads__ssh.run(cmd=f"oc get pvc -n {namespace} -o yaml > {pvc_file} 2>&1")
+            for namespace in namespaces:
+                pvc_file = os.path.join(
+                    logs_folder,
+                    self._multi_ns_artifact_name("vm_pvc_status.yaml", namespace, namespaces),
+                )
+                self._OadpWorkloads__ssh.run(cmd=f"oc get pvc -n {namespace} -o yaml > {pvc_file} 2>&1")
         except Exception as err:
             logger.warning(f"collect_vm_pvc_status failed: {err}")
 

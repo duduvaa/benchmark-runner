@@ -1,7 +1,7 @@
 # Multi-Namespace VM Scenarios
 
 **Label:** `wayfinder:task`  
-**Status:** Open  
+**Status:** Open (native path only — script path done via 029 + 030)  
 **Blocked by:** [Script Integration Dispatch](019-script-integration-dispatch.md)
 
 ## Question
@@ -21,3 +21,8 @@ Extend VM dataset creation to support `total_namespaces > 1` with user-specified
 The script-based path (Phase 1) gets multi-NS nearly for free via `-ns N`. The native path (Phase 2) needs the iteration logic implemented.
 
 Resolve: both script-based and native multi-NS paths work, unit tested, validated on cluster with 2+ namespaces.
+
+## Progress
+
+- **Script path (Phase 1):** Done — [029](029-multi-namespace-vm-population.md) (population + backup) and [030](030-phase1-closeout-multi-ns-and-flow2-restore.md) (cleanup / logs / reporting / restore coverage). `tests.yaml` TC 10.8 / 10.9 cover `ns: 3`.
+- **Native path (Phase 2):** Still open — extend `create_vm_dataset()` for `total_namespaces > 1`.

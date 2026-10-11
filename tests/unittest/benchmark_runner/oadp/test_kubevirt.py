@@ -22,13 +22,17 @@ from benchmark_runner.oadp.constants import (
     VM_DEFAULT_SSH_USER,
     VM_POPULATION_METHOD_SCRIPT,
 )
+from benchmark_runner.oadp.cleanup import OadpCleanupMixin
 from benchmark_runner.oadp.configuration import OadpConfigurationMixin
 from benchmark_runner.oadp.dataset import OadpDatasetMixin
 from benchmark_runner.oadp.execution import OadpExecutionMixin
+from benchmark_runner.oadp.log_collection import OadpLogCollectionMixin
+from benchmark_runner.oadp.reporting import OadpReportingMixin
 from benchmark_runner.oadp.scenario import (
     OadpScenarioMixin,
     expand_multi_namespaces,
     get_script_ns_count,
+    scenario_backup_namespaces,
     scenario_includes_kubevirt_dataset,
 )
 from benchmark_runner.oadp.vm_operations import OadpVmOperationsMixin
@@ -187,6 +191,26 @@ class TestableConfiguration(OadpConfigurationMixin, OadpWorkloads):
 
 class TestableExecution(OadpExecutionMixin, OadpConfigurationMixin, OadpWorkloads):
     pass
+
+
+class TestableCleanup(OadpCleanupMixin, OadpScenarioMixin, OadpWorkloads):
+    __test__ = False
+
+    def __init__(self):
+        super().__init__()
+        # Mixin reads mangled OadpWorkloads private attrs.
+        self._OadpWorkloads__oadp_cleanup_dataset_post_run = True
+        self._OadpWorkloads__oadp_cleanup_cr_post_run = False
+        self._OadpWorkloads__oadp_misc_dir = "/tmp/oadp-misc"
+        self.delete_source_dataset = MagicMock()
+
+
+class TestableReporting(OadpReportingMixin, OadpWorkloads):
+    __test__ = False
+
+
+class TestableLogCollection(OadpLogCollectionMixin, OadpWorkloads):
+    __test__ = False
 
 
 class TestableIncrementalData(
@@ -2063,3 +2087,214 @@ class TestOadpExecuteScenarioMultiNamespaceIncludeNamespaces:
             "rhel9-oadp-2vms-1os-1data-cbt-rbd-ns1,rhel9-oadp-2vms-1os-1data-cbt-rbd-ns2"
         )
         assert call_kwargs["resource_policy_configmap"] == KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME
+
+
+# ===========================================================================
+# Phase 1 closeout: multi-ns cleanup/logs/reporting + Flow2 restore resourcePolicy
+# ===========================================================================
+
+
+class TestScenarioBackupNamespaces:
+    def test_single_namespace_unchanged(self):
+        s = _script_kubevirt_scenario()
+        assert scenario_backup_namespaces(s) == ["kubevirt-script-2vm-1data-ns1"]
+
+    def test_expands_sibling_namespaces(self):
+        s = _multi_ns_script_scenario(ns_count=3, base="perf-rhel9-2vms-1os-1data-rbd-3ns")
+        assert scenario_backup_namespaces(s) == [
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns1",
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns2",
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns3",
+        ]
+
+    def test_empty_when_namespaces_to_backup_missing(self):
+        s = _kubevirt_scenario()
+        assert scenario_backup_namespaces(s) == []
+
+
+class TestCleanupMultiNamespace:
+    @pytest.fixture
+    def mx(self):
+        return TestableCleanup()
+
+    def test_dataset_cleanup_loops_all_sibling_namespaces(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx._OadpWorkloads__scenario_datasets = []
+        mx.cleaning_up_oadp_resources(scenario)
+        deleted = [c.kwargs["target_namespace"] for c in mx.delete_source_dataset.call_args_list]
+        assert deleted == [
+            "kubevirt-script-2vm-1data-rbd-ns1",
+            "kubevirt-script-2vm-1data-rbd-ns2",
+            "kubevirt-script-2vm-1data-rbd-ns3",
+        ]
+
+    def test_dataset_cleanup_prefers_loaded_scenario_datasets(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=3)
+        mx._OadpWorkloads__scenario_datasets = [
+            {"namespace": "loaded-ns1"},
+            {"namespace": "loaded-ns2"},
+        ]
+        mx.cleaning_up_oadp_resources(scenario)
+        deleted = [c.kwargs["target_namespace"] for c in mx.delete_source_dataset.call_args_list]
+        assert deleted == ["loaded-ns1", "loaded-ns2"]
+
+    def test_ns_scoped_vsc_clean_loops_siblings(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=2)
+        mx._OadpWorkloads__scenario_datasets = []
+        mx._OadpWorkloads__ssh.run.return_value = "ok"
+        mx.delete_vsc(scenario, ns_scoped=True)
+        cmds = [c.kwargs["cmd"] for c in mx._OadpWorkloads__ssh.run.call_args_list]
+        assert any("kubevirt-script-2vm-1data-rbd-ns1" in c for c in cmds)
+        assert any("kubevirt-script-2vm-1data-rbd-ns2" in c for c in cmds)
+
+
+class TestReportingMultiNamespaceVmCounts:
+    @pytest.fixture
+    def mx(self):
+        m = TestableReporting()
+        # Sequence: cnv csv name, then per-NS vm/vmi/dv counts for 2 namespaces.
+        m._OadpWorkloads__ssh.run.side_effect = [
+            "kubevirt-hyperconverged-operator.v4.17.0",
+            "4.17.0",
+            "2",  # ns1 vms
+            "2",  # ns1 running vmis
+            "4",  # ns1 dvs
+            "2",  # ns2 vms
+            "1",  # ns2 running vmis
+            "4",  # ns2 dvs
+        ]
+        return m
+
+    def test_aggregates_vm_counts_across_sibling_namespaces(self, mx):
+        scenario = _multi_ns_script_scenario(ns_count=2)
+        mx.enrich_summary_with_vm_metadata(scenario)
+        counts = mx._OadpWorkloads__run_metadata["summary"]["resources"]["vm_counts"]
+        assert counts == {"total_vms": 4, "running_vmis": 3, "total_datavolumes": 8}
+
+
+class TestLogCollectionMultiNamespace:
+    @pytest.fixture
+    def mx(self, tmp_path):
+        m = TestableLogCollection()
+        m._logs = tmp_path
+        return m
+
+    def test_collect_dv_status_writes_per_namespace_files_when_multi_ns(self, mx, tmp_path):
+        scenario = _multi_ns_script_scenario(ns_count=2)
+        mx._OadpWorkloads__ssh.run.return_value = ""
+        mx.collect_dv_status(str(tmp_path), scenario)
+        cmds = [c.kwargs["cmd"] for c in mx._OadpWorkloads__ssh.run.call_args_list]
+        assert any("kubevirt-script-2vm-1data-rbd-ns1" in c and "datavolumes_status_" in c for c in cmds)
+        assert any("kubevirt-script-2vm-1data-rbd-ns2" in c and "datavolumes_status_" in c for c in cmds)
+
+    def test_collect_dv_status_keeps_single_filename_for_one_ns(self, mx, tmp_path):
+        scenario = _script_kubevirt_scenario()
+        mx._OadpWorkloads__ssh.run.return_value = ""
+        mx.collect_dv_status(str(tmp_path), scenario)
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "datavolumes_status.yaml" in cmd
+        assert "datavolumes_status_" not in cmd
+
+
+class TestExecRestoreResourcePolicy:
+    @pytest.fixture
+    def mx(self):
+        m = TestableExecution()
+        m._OadpWorkloads__test_env["source"] = "downstream"
+        m._OadpWorkloads__ssh.run.return_value = 'Restore request "r1" submitted successfully.'
+        return m
+
+    def test_downstream_cbt_restore_gets_resource_policy_flag(self, mx):
+        mx.exec_restore(
+            plugin="kubevirt",
+            restore_name="r1",
+            backup_name="b1",
+            resource_policy_configmap=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert f"--resource-policies-configmap {KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME}" in cmd
+
+    def test_downstream_restore_without_policy_omits_flag(self, mx):
+        mx.exec_restore(plugin="kubevirt", restore_name="r1", backup_name="b1")
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--resource-policies-configmap" not in cmd
+
+    def test_upstream_restore_never_gets_resource_policy_flag(self, mx):
+        mx._OadpWorkloads__test_env["source"] = "upstream"
+        mx._OadpWorkloads__test_env["velero_cli_path"] = "/tmp/velero-1-12"
+        mx.exec_restore(
+            plugin="kubevirt",
+            restore_name="r1",
+            backup_name="b1",
+            resource_policy_configmap=KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "--resource-policies-configmap" not in cmd
+
+
+class TestOadpExecuteScenarioRestoreResourcePolicyWiring:
+    @pytest.fixture
+    def mx(self):
+        m = TestableExecution()
+        m._OadpWorkloads__test_env["source"] = "downstream"
+        m.ds_get_all_namespaces = MagicMock(return_value=["ns1"])
+        m.exec_restore = MagicMock()
+        m.wait_for_condition_of_cr = MagicMock(return_value=True)
+        return m
+
+    def _restore_scenario(self, cbt):
+        s = _script_kubevirt_scenario()
+        s["testtype"] = "restore"
+        s["args"]["OADP_CR_TYPE"] = "restore"
+        s["args"]["OADP_CR_NAME"] = "restore-kubevirt-script"
+        s["args"]["vm_population_script_args"]["cbt"] = cbt
+        return s
+
+    def test_cbt_restore_passes_resource_policy_configmap(self, mx):
+        mx.oadp_execute_scenario(self._restore_scenario(cbt=True), run_method="python")
+        call_kwargs = mx.exec_restore.call_args.kwargs
+        assert call_kwargs["resource_policy_configmap"] == KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME
+
+    def test_non_cbt_restore_passes_none(self, mx):
+        mx.oadp_execute_scenario(self._restore_scenario(cbt=False), run_method="python")
+        call_kwargs = mx.exec_restore.call_args.kwargs
+        assert call_kwargs["resource_policy_configmap"] is None
+
+
+class TestMultiNsScenariosFromTestsYamlShapes:
+    """Framework-side shapes matching tests.yaml TC 10.8 / 10.9 (ns > 1 already in mpqe)."""
+
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_flow2_cbt_3ns_scenario_validates(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-dm-rhel9-2vms-1os-1data-cbt-3ns-cephrbd",
+            10.8,
+            "backup",
+            vms=2,
+            data_disks=1,
+            namespace="perf-rhel9-2vms-1os-1data-cbt-rbd-3ns-ns1",
+            cbt=True,
+        )
+        s["args"]["vm_population_script_args"]["ns"] = 3
+        assert mx.validate_scenario(s) is True
+        assert get_script_ns_count(s) == 3
+
+    def test_flow1_3ns_scenario_validates(self, mx):
+        s = _tests_yaml_script_scenario(
+            "backup-dm-rhel9-2vms-1os-1data-3ns-cephrbd",
+            10.9,
+            "backup",
+            vms=2,
+            data_disks=1,
+            namespace="perf-rhel9-2vms-1os-1data-rbd-3ns-ns1",
+        )
+        s["args"]["vm_population_script_args"]["ns"] = 3
+        assert mx.validate_scenario(s) is True
+        assert scenario_backup_namespaces(s) == [
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns1",
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns2",
+            "perf-rhel9-2vms-1os-1data-rbd-3ns-ns3",
+        ]

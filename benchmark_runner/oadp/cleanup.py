@@ -11,6 +11,7 @@ import time
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
 from benchmark_runner.oadp.constants import PLUGIN_VBD, SOURCE_DOWNSTREAM, SOURCE_UPSTREAM
+from benchmark_runner.oadp.scenario import scenario_backup_namespaces
 
 
 class OadpCleanupMixin:
@@ -70,7 +71,11 @@ class OadpCleanupMixin:
                     f"self.__oadp_cleanup_dataset_post_run: "
                     f"{self._OadpWorkloads__oadp_cleanup_dataset_post_run}"
                 )
-                self.delete_source_dataset(target_namespace=scenario["args"]["namespaces_to_backup"])
+                # Prefer loaded scenario_datasets (covers list-form multi-NS); fall
+                # back to expanding namespaces_to_backup for script ns > 1 (ticket 029).
+                namespaces = self.ds_get_all_namespaces() or scenario_backup_namespaces(scenario)
+                for ns in namespaces:
+                    self.delete_source_dataset(target_namespace=ns)
             else:
                 logger.info(
                     f"*** Skipping post run cleaning up of OADP dataset *** as "
@@ -178,13 +183,18 @@ class OadpCleanupMixin:
         """Remove volume snapshot content cluster-wide or namespace-scoped per scenario plugin."""
         cr_type = scenario["args"]["OADP_CR_TYPE"]
         cr_name = scenario["args"]["OADP_CR_NAME"]
-        target_namespace = scenario["args"]["namespaces_to_backup"]
 
         if ns_scoped:
-            logger.info("::: INFO :: Attempting VSC Clean via vsc_clean.sh script meaning scoped to specific ns")
-            vsc_cmd = self._OadpWorkloads__ssh.run(
-                cmd=f"{self._OadpWorkloads__oadp_misc_dir}/vsc_clean.sh {target_namespace} {cr_type} {cr_name}"
+            namespaces = self.ds_get_all_namespaces() or scenario_backup_namespaces(scenario)
+            logger.info(
+                f"::: INFO :: Attempting VSC Clean via vsc_clean.sh script meaning scoped to "
+                f"namespaces: {namespaces}"
             )
+            vsc_cmd = ""
+            for target_namespace in namespaces:
+                vsc_cmd = self._OadpWorkloads__ssh.run(
+                    cmd=f"{self._OadpWorkloads__oadp_misc_dir}/vsc_clean.sh {target_namespace} {cr_type} {cr_name}"
+                )
         else:
             logger.info("::: INFO :: Attempting VSC Clean ALL vsc")
             if scenario["args"]["plugin"] != PLUGIN_VBD:

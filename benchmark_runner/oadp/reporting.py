@@ -12,6 +12,7 @@ from typing import Any, NoReturn
 
 from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time_stamp
 from benchmark_runner.oadp.constants import DATETIME_FORMAT, RESULT_REPORT_PATH, VM_DATASET_ROLE
+from benchmark_runner.oadp.scenario import scenario_backup_namespaces
 
 
 class OadpReportingMixin:
@@ -252,15 +253,24 @@ class OadpReportingMixin:
                     "csv": cnv_csv.strip(),
                 }
 
-            namespace = scenario["args"].get("namespaces_to_backup", "")
-            if namespace:
-                vm_count = ssh.run(cmd=f"oc get vm -n {namespace} --no-headers 2>/dev/null | wc -l")
-                running_vmis = ssh.run(cmd=f"oc get vmi -n {namespace} --no-headers 2>/dev/null | grep -c Running")
-                dv_count = ssh.run(cmd=f"oc get dv -n {namespace} --no-headers 2>/dev/null | wc -l")
+            namespaces = scenario_backup_namespaces(scenario)
+            if namespaces:
+                total_vms = 0
+                running_vmis = 0
+                total_datavolumes = 0
+                for namespace in namespaces:
+                    vm_count = ssh.run(cmd=f"oc get vm -n {namespace} --no-headers 2>/dev/null | wc -l")
+                    running = ssh.run(
+                        cmd=f"oc get vmi -n {namespace} --no-headers 2>/dev/null | grep -c Running"
+                    )
+                    dv_count = ssh.run(cmd=f"oc get dv -n {namespace} --no-headers 2>/dev/null | wc -l")
+                    total_vms += self._safe_int(vm_count)
+                    running_vmis += self._safe_int(running)
+                    total_datavolumes += self._safe_int(dv_count)
                 run_metadata["summary"]["resources"]["vm_counts"] = {
-                    "total_vms": self._safe_int(vm_count),
-                    "running_vmis": self._safe_int(running_vmis),
-                    "total_datavolumes": self._safe_int(dv_count),
+                    "total_vms": total_vms,
+                    "running_vmis": running_vmis,
+                    "total_datavolumes": total_datavolumes,
                 }
 
         except Exception as err:

@@ -68,6 +68,19 @@ def expand_multi_namespaces(namespace: str, ns_count: int) -> list:
     return [f"{base}-ns{i}" for i in range(1, ns_count + 1)]
 
 
+def scenario_backup_namespaces(scenario: dict) -> list:
+    """Return every namespace a scenario backs up/restores (ticket 029).
+
+    Expands ``args.namespaces_to_backup`` via ``vm_population_script_args.ns``
+    so callers that only have the scenario dict (cleanup, log collection,
+    reporting) cover sibling namespaces without needing ``scenario_datasets``.
+    """
+    base = scenario.get("args", {}).get("namespaces_to_backup", "")
+    if not base:
+        return []
+    return expand_multi_namespaces(base, get_script_ns_count(scenario))
+
+
 class OadpScenarioMixin:
     """Scenario YAML loading, validation, dataset helpers, index generation."""
 
