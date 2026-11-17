@@ -17,6 +17,7 @@ from benchmark_runner.oadp.constants import (
     KNOWN_INCREMENT_LEVELS,
     KNOWN_PLUGINS,
     KNOWN_VM_POPULATION_METHODS,
+    KNOWN_VM_POPULATION_OS,
     MPQE_VM_SCRIPT_NS_SUFFIX,
     PLUGIN_KUBEVIRT,
     SHELL_METACHARACTERS,
@@ -24,6 +25,8 @@ from benchmark_runner.oadp.constants import (
     VM_DATASET_ROLE,
     VM_POPULATION_METHOD_NATIVE,
     VM_POPULATION_METHOD_SCRIPT,
+    VM_POPULATION_OS_RHEL,
+    VM_POPULATION_OS_WINDOWS,
 )
 from benchmark_runner.oadp.oadp_exceptions import OadpError
 
@@ -42,12 +45,16 @@ def get_script_ns_count(scenario: dict) -> int:
     """Return 'vm_population_script_args.ns' (ticket 029), default 1.
 
     'ns' > 1 means VMsPopulation.sh populates 'ns' sibling namespaces with the
-    same VM/disk/CBT configuration instead of just one.
+    same VM/disk/CBT configuration instead of just one. Windows script
+    population does not support multi-NS yet — always returns 1.
     """
     args = scenario.get("args", {})
     if args.get("vm_population_method") != VM_POPULATION_METHOD_SCRIPT:
         return 1
-    return int(args.get("vm_population_script_args", {}).get("ns", 1))
+    script_args = args.get("vm_population_script_args", {})
+    if script_args.get("os", VM_POPULATION_OS_RHEL) == VM_POPULATION_OS_WINDOWS:
+        return 1
+    return int(script_args.get("ns", 1))
 
 
 def expand_multi_namespaces(namespace: str, ns_count: int) -> list:
@@ -235,9 +242,9 @@ class OadpScenarioMixin:
         Defaults to the native Python pipeline when 'vm_population_method' is
         absent. When set to 'script', requires 'vm_population_script_args'
         with 'vms' (positive int) and 'data_disks' (non-negative int; 0 means
-        OS disk only), and validates the optional 'cbt' boolean flag and the
-        optional 'ns' positive-int flag (number of sibling namespaces to
-        populate, default 1 — ticket 029).
+        OS disk only for RHEL). Optional 'os' is 'rhel' (default) or 'windows'.
+        Also validates optional 'cbt' / 'ns' for RHEL, and Windows-specific
+        fields (windowsImageUrl required; sizes / gen params optional).
         """
         method = args.get("vm_population_method", VM_POPULATION_METHOD_NATIVE)
         if method not in KNOWN_VM_POPULATION_METHODS:
@@ -257,7 +264,20 @@ class OadpScenarioMixin:
             )
             return False
 
-        if "vms" not in script_args or "data_disks" not in script_args:
+        os_name = script_args.get("os", VM_POPULATION_OS_RHEL)
+        if os_name not in KNOWN_VM_POPULATION_OS:
+            logger.error(
+                f"Error: Unknown vm_population_script_args.os '{os_name}'. "
+                f"Allowed: {sorted(KNOWN_VM_POPULATION_OS)}"
+            )
+            return False
+
+        if "vms" not in script_args:
+            logger.error("Error: vm_population_script_args requires 'vms'.")
+            return False
+
+        # RHEL keeps requiring data_disks; Windows defaults to 1 when omitted.
+        if os_name == VM_POPULATION_OS_RHEL and "data_disks" not in script_args:
             logger.error("Error: vm_population_script_args requires both 'vms' and 'data_disks'.")
             return False
 
@@ -266,10 +286,16 @@ class OadpScenarioMixin:
             logger.error(f"Error: vm_population_script_args.vms must be a positive integer, got {vms!r}")
             return False
 
-        data_disks = script_args.get("data_disks")
+        data_disks = script_args.get("data_disks", 1 if os_name == VM_POPULATION_OS_WINDOWS else None)
         if not isinstance(data_disks, int) or isinstance(data_disks, bool) or data_disks < 0:
             logger.error(
                 f"Error: vm_population_script_args.data_disks must be a non-negative integer, got {data_disks!r}"
+            )
+            return False
+        if os_name == VM_POPULATION_OS_WINDOWS and data_disks < 1:
+            logger.error(
+                f"Error: Windows vm_population_script_args.data_disks must be >= 1 "
+                f"(OS C: + at least D:), got {data_disks!r}"
             )
             return False
 
@@ -282,6 +308,32 @@ class OadpScenarioMixin:
         if not isinstance(ns, int) or isinstance(ns, bool) or ns < 1:
             logger.error(f"Error: vm_population_script_args.ns must be a positive integer, got {ns!r}")
             return False
+
+        if os_name == VM_POPULATION_OS_WINDOWS:
+            if cbt:
+                logger.error("Error: vm_population_script_args.cbt is not supported for os: windows yet.")
+                return False
+            if ns != 1:
+                logger.error("Error: vm_population_script_args.ns > 1 is not supported for os: windows yet.")
+                return False
+            windows_image_url = script_args.get("windowsImageUrl")
+            if not isinstance(windows_image_url, str) or not windows_image_url.strip():
+                logger.error("Error: vm_population_script_args.windowsImageUrl is required when os: windows.")
+                return False
+            for int_key in ("datadircount", "datafilesperdir"):
+                if int_key in script_args:
+                    val = script_args[int_key]
+                    if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+                        logger.error(
+                            f"Error: vm_population_script_args.{int_key} must be a positive integer, got {val!r}"
+                        )
+                        return False
+            for str_key in ("osdisksize", "datadisksize", "datafilesize", "windowsImageUrl"):
+                if str_key in script_args and not isinstance(script_args[str_key], str):
+                    logger.error(
+                        f"Error: vm_population_script_args.{str_key} must be a string, got {script_args[str_key]!r}"
+                    )
+                    return False
 
         for key, value in script_args.items():
             if isinstance(value, str) and (any(ch in value for ch in SHELL_METACHARACTERS) or "'" in value):
@@ -314,6 +366,14 @@ class OadpScenarioMixin:
             logger.error(
                 "Error: 'increment_level' requires vm_population_method 'script' "
                 "(VMsAddDataVerify.sh's incremental data model only applies to script-populated VMs)."
+            )
+            return False
+
+        script_os = args.get("vm_population_script_args", {}).get("os", VM_POPULATION_OS_RHEL)
+        if script_os == VM_POPULATION_OS_WINDOWS:
+            logger.error(
+                "Error: 'increment_level' is not supported for os: windows "
+                "(VMsAddDataVerify.sh is RHEL-only)."
             )
             return False
 

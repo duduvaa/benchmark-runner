@@ -10,9 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from benchmark_runner.oadp.constants import (
+    CNV_SCENARIOS_PATH,
+    CNV_WINDOWS_WORKLOAD,
     KNOWN_INCREMENT_LEVELS,
     KNOWN_PLUGINS,
     KNOWN_VM_POPULATION_METHODS,
+    KNOWN_VM_POPULATION_OS,
     KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME,
     MPQE_VM_SCRIPT_NS_SUFFIX,
     MPQE_VM_SCRIPTS_PATH,
@@ -21,6 +24,8 @@ from benchmark_runner.oadp.constants import (
     VM_DATASET_ROLE,
     VM_DEFAULT_SSH_USER,
     VM_POPULATION_METHOD_SCRIPT,
+    VM_POPULATION_OS_WINDOWS,
+    WINDOWS_D_DRIVE_DATA_GB,
 )
 from benchmark_runner.oadp.cleanup import OadpCleanupMixin
 from benchmark_runner.oadp.configuration import OadpConfigurationMixin
@@ -2290,3 +2295,231 @@ class TestMultiNsScenariosFromTestsYamlShapes:
             "perf-rhel9-2vms-1os-1data-rbd-3ns-ns2",
             "perf-rhel9-2vms-1os-1data-rbd-3ns-ns3",
         ]
+
+
+# ===========================================================================
+# Windows script population (cnv-scenarios run-workloads.sh)
+# ===========================================================================
+
+
+def _windows_script_scenario(**overrides):
+    s = _kubevirt_scenario()
+    s["name"] = "backup-dm-win2022-1vm-1os-1data-cephrbd"
+    s["testcase"] = "13.0"
+    s["dataset"]["vm_profile"] = "win2022-hammerdb-mssql"
+    s["dataset"]["vms_per_namespace"] = 1
+    s["dataset"]["sc"] = "ocs-storagecluster-ceph-rbd"
+    s["args"] = _valid_args(
+        namespaces_to_backup="perf-win2022-1vm-1os-1data-rbd-ns1",
+        vm_population_method="script",
+        vm_population_script_args={
+            "os": "windows",
+            "windowsImageUrl": "http://f01-h08-000-1029u.rdu2.scalelab.redhat.com:9002/winmssql2022.qcow2",
+            "osdisksize": "80Gi",
+            "datadisksize": "150Gi",
+            "vms": 1,
+            "data_disks": 2,
+            "datadircount": 5,
+            "datafilesperdir": 10,
+            "datafilesize": "1G",
+        },
+    )
+    s.update(overrides)
+    return s
+
+
+class TestWindowsVmPopulationValidation:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_known_os_values(self):
+        assert KNOWN_VM_POPULATION_OS == {"rhel", "windows"}
+
+    def test_valid_windows_scenario(self, mx):
+        assert mx.validate_scenario(_windows_script_scenario()) is True
+
+    def test_os_defaults_to_rhel_when_absent(self, mx):
+        s = _script_kubevirt_scenario()
+        assert "os" not in s["args"]["vm_population_script_args"]
+        assert mx.validate_scenario(s) is True
+
+    def test_unknown_os_rejected(self, mx):
+        s = _script_kubevirt_scenario()
+        s["args"]["vm_population_script_args"]["os"] = "macos"
+        assert mx.validate_scenario(s) is False
+
+    def test_windows_requires_image_url(self, mx):
+        s = _windows_script_scenario()
+        del s["args"]["vm_population_script_args"]["windowsImageUrl"]
+        assert mx.validate_scenario(s) is False
+
+    def test_windows_rejects_cbt(self, mx):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["cbt"] = True
+        assert mx.validate_scenario(s) is False
+
+    def test_windows_rejects_ns_greater_than_one(self, mx):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["ns"] = 2
+        assert mx.validate_scenario(s) is False
+
+    def test_windows_allows_omitting_data_disks(self, mx):
+        s = _windows_script_scenario()
+        del s["args"]["vm_population_script_args"]["data_disks"]
+        assert mx.validate_scenario(s) is True
+
+    def test_windows_rejects_data_disks_zero(self, mx):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["data_disks"] = 0
+        assert mx.validate_scenario(s) is False
+
+    def test_windows_get_script_ns_count_always_one(self):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["ns"] = 5  # invalid for validate, but helper must ignore
+        assert get_script_ns_count(s) == 1
+
+    def test_windows_increment_level_rejected(self, mx):
+        s = _windows_script_scenario()
+        s["args"]["increment_level"] = "inc1"
+        assert mx.validate_scenario(s) is False
+
+
+class TestWindowsExpectedCapacity:
+    def test_single_data_disk_is_48_only(self):
+        extra, total = OadpVmOperationsMixin._windows_expected_capacity_gb(data_disks=1)
+        assert extra is None
+        assert total == WINDOWS_D_DRIVE_DATA_GB
+
+    def test_two_data_disks_default_gen_params(self):
+        extra, total = OadpVmOperationsMixin._windows_expected_capacity_gb(data_disks=2)
+        assert extra == 50
+        assert total == 98
+
+    def test_three_data_disks_default_gen_params(self):
+        extra, total = OadpVmOperationsMixin._windows_expected_capacity_gb(data_disks=3)
+        assert extra == 100
+        assert total == 148
+
+    def test_custom_gen_params(self):
+        extra, total = OadpVmOperationsMixin._windows_expected_capacity_gb(
+            data_disks=2, dir_count=2, files_per_dir=5, file_size="2G"
+        )
+        assert extra == 20
+        assert total == 68
+
+    def test_parse_file_size_1g(self):
+        assert OadpVmOperationsMixin._parse_file_size_to_gb("1G") == 1.0
+
+
+class TestWindowsPopulationCommand:
+    def test_builds_env_and_command_with_extra_capacity(self):
+        s = _windows_script_scenario()
+        cmd = OadpVmOperationsMixin._build_windows_population_command(
+            s, "perf-win2022-1vm-1os-1data-rbd-ns1"
+        )
+        assert cmd.startswith(f"cd {CNV_SCENARIOS_PATH} && ")
+        assert "windowsImageUrl='http://f01-h08-000-1029u.rdu2.scalelab.redhat.com:9002/winmssql2022.qcow2'" in cmd
+        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'" in cmd
+        assert "rootStorage='80Gi'" in cmd
+        assert "diskSize='150Gi'" in cmd
+        assert "vmCount='1'" in cmd
+        assert "dataDisks='2'" in cmd
+        assert "dirCount='5'" in cmd
+        assert "filesPerDir='10'" in cmd
+        assert "fileSize='1G'" in cmd
+        assert "expectedExtraDiskCapacityGB='50'" in cmd
+        assert "expectedTotalDiskUtilGB='98'" in cmd
+        assert f"./run-workloads.sh {CNV_WINDOWS_WORKLOAD} --os windows" in cmd
+
+    def test_single_disk_omits_extra_capacity_env(self):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["data_disks"] = 1
+        cmd = OadpVmOperationsMixin._build_windows_population_command(
+            s, "perf-win2022-1vm-1os-1data-rbd-ns1"
+        )
+        assert "expectedExtraDiskCapacityGB" not in cmd
+        assert "expectedTotalDiskUtilGB='48'" in cmd
+
+    def test_defaults_applied_when_optional_sizes_absent(self):
+        s = _windows_script_scenario()
+        for key in ("osdisksize", "datadisksize", "datadircount", "datafilesperdir", "datafilesize"):
+            del s["args"]["vm_population_script_args"][key]
+        s["args"]["vm_population_script_args"]["data_disks"] = 2
+        cmd = OadpVmOperationsMixin._build_windows_population_command(
+            s, "perf-win2022-1vm-1os-1data-rbd-ns1"
+        )
+        assert "rootStorage='80Gi'" in cmd
+        assert "diskSize='150Gi'" in cmd
+        # Gen params not overridden on CLI when absent from scenario (vars.yml defaults).
+        assert "dirCount=" not in cmd
+        assert "filesPerDir=" not in cmd
+        assert "fileSize=" not in cmd
+        assert "expectedExtraDiskCapacityGB='50'" in cmd
+        assert "expectedTotalDiskUtilGB='98'" in cmd
+
+
+class TestWindowsPopulationStdoutPassFail:
+    def test_success_banner(self):
+        out = "✓ Test Complete - SUCCESS (windows)\nexit_code=0"
+        assert OadpVmOperationsMixin._windows_population_succeeded(out) is True
+
+    def test_failed_banner(self):
+        out = "✗ Test Complete - FAILED (windows, exit code: 1)"
+        assert OadpVmOperationsMixin._windows_population_succeeded(out) is False
+
+    def test_neither_banner(self):
+        assert OadpVmOperationsMixin._windows_population_succeeded("something else") is None
+
+
+class TestCreateWindowsVmDatasetViaScript:
+    @pytest.fixture
+    def mx(self):
+        m = TestableVmOps()
+        m._OadpWorkloads__ssh.run.return_value = (
+            "✓ Test Complete - SUCCESS (windows)\nMPQE_SCRIPT_EXIT_CODE:0"
+        )
+        return m
+
+    def test_dispatches_to_run_workloads_not_vmspopulation(self, mx):
+        scenario = _windows_script_scenario()
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"})
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "VMsPopulation.sh" not in cmd
+        assert "run-workloads.sh hammerdb-mssql --os windows" in cmd
+        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'" in cmd
+
+    def test_rhel_path_unchanged(self, mx):
+        scenario = _script_kubevirt_scenario()
+        mx.create_vm_dataset_via_script(scenario, {"namespace": "kubevirt-script-2vm-1data-ns1"})
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "VMsPopulation.sh" in cmd
+        assert "run-workloads.sh" not in cmd
+
+    def test_fails_when_stdout_reports_failed_even_if_exit_zero(self, mx):
+        mx._OadpWorkloads__ssh.run.return_value = (
+            "✗ Test Complete - FAILED (windows, exit code: 1)\nMPQE_SCRIPT_EXIT_CODE:0"
+        )
+        with pytest.raises(RuntimeError, match="FAILED"):
+            mx.create_vm_dataset_via_script(
+                _windows_script_scenario(),
+                {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"},
+            )
+
+
+class TestWindowsProfileLoader:
+    def test_win2022_profile_loads(self):
+        profile = load_vm_profile("win2022-hammerdb-mssql")
+        assert profile["os"]["type"] == "windows"
+        assert profile["name"] == "win2022-hammerdb-mssql"
+
+
+class TestWindowsScenarioFromTestsYamlShape:
+    @pytest.fixture
+    def mx(self):
+        return TestableScenario()
+
+    def test_tc_13_0_shape_validates(self, mx):
+        s = _windows_script_scenario()
+        assert mx.validate_scenario(s) is True
+        assert s["args"]["vm_population_script_args"]["os"] == VM_POPULATION_OS_WINDOWS

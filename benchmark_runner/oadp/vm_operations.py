@@ -20,6 +20,8 @@ from benchmark_runner.common.logger.logger_time_stamp import logger, logger_time
 from benchmark_runner.common.oc.oc import OC
 from benchmark_runner.common.virtctl.virtctl import Virtctl
 from benchmark_runner.oadp.constants import (
+    CNV_SCENARIOS_PATH,
+    CNV_WINDOWS_WORKLOAD,
     MPQE_VM_SCRIPT_NS_SUFFIX,
     MPQE_VM_SCRIPTS_PATH,
     SHELL_METACHARACTERS,
@@ -27,6 +29,15 @@ from benchmark_runner.oadp.constants import (
     VM_DEFAULT_POPULATION_CONCURRENCY,
     VM_DEFAULT_SSH_USER,
     VM_DEFAULT_THROTTLE_BATCHES,
+    VM_POPULATION_OS_RHEL,
+    VM_POPULATION_OS_WINDOWS,
+    WINDOWS_D_DRIVE_DATA_GB,
+    WINDOWS_DEFAULT_DATA_DISK_SIZE,
+    WINDOWS_DEFAULT_DATA_DISKS,
+    WINDOWS_DEFAULT_DIR_COUNT,
+    WINDOWS_DEFAULT_FILE_SIZE,
+    WINDOWS_DEFAULT_FILES_PER_DIR,
+    WINDOWS_DEFAULT_OS_DISK_SIZE,
 )
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
 
@@ -180,22 +191,32 @@ class OadpVmOperationsMixin:
 
     @logger_time_stamp
     def create_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
-        """Create a KubeVirt VM dataset via VMsPopulation.sh (Phase 1 script-integration path).
+        """Create a KubeVirt VM dataset via an external population script.
 
         Alternative to ``create_vm_dataset()`` for scenarios with
-        ``vm_population_method: script``. Blocks until the script completes —
-        it internally waits for VMs to boot, populates baseline data, and
-        (optionally) enables CBT before returning.
+        ``vm_population_method: script``. Dispatches on
+        ``vm_population_script_args.os``:
+
+        - ``rhel`` / absent → ``VMsPopulation.sh`` (RHEL only)
+        - ``windows`` → ``cnv-scenarios/run-workloads.sh hammerdb-mssql --os windows``
 
         Multi-namespace groups (``vm_population_script_args.ns`` > 1, ticket
-        029): a single ``VMsPopulation.sh -ns N`` invocation creates every
-        sibling namespace ('<base>-ns1'..'<base>-nsN') at once — there is no
-        way to ask the script to create just one sibling on its own. So this
-        method only actually runs the script when ``ds`` is the group's
-        '-ns1' member (the "leader"); it's called once per sibling namespace
-        by ``verify_vm_datasets_before_backups()``, and the non-leader calls
-        are no-ops beyond recording their own CBT state.
+        029, RHEL only): a single ``VMsPopulation.sh -ns N`` invocation creates
+        every sibling namespace ('<base>-ns1'..'<base>-nsN') at once — there is
+        no way to ask the script to create just one sibling on its own. So this
+        method only actually runs the RHEL script when ``ds`` is the group's
+        '-ns1' member (the "leader"); non-leader calls are no-ops beyond
+        recording their own CBT state.
         """
+        script_args = scenario["args"].get("vm_population_script_args", {})
+        os_name = script_args.get("os", VM_POPULATION_OS_RHEL)
+        if os_name == VM_POPULATION_OS_WINDOWS:
+            self._create_windows_vm_dataset_via_script(scenario, ds)
+            return
+        self._create_rhel_vm_dataset_via_script(scenario, ds)
+
+    def _create_rhel_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
+        """Populate RHEL VMs via ``VMsPopulation.sh``."""
         namespace = ds["namespace"]
         script_args = scenario["args"].get("vm_population_script_args", {})
         vms = int(script_args.get("vms", 1))
@@ -230,6 +251,155 @@ class OadpVmOperationsMixin:
         if cbt:
             cbt_state = self.check_cbt_state(namespace)
             self._record_cbt_state(namespace, cbt_state)
+
+    # ------------------------------------------------------------------
+    # Windows script population (cnv-scenarios run-workloads.sh)
+    # ------------------------------------------------------------------
+
+    _WINDOWS_SUCCESS_RE = re.compile(r"Test Complete - SUCCESS\s*\(windows\)", re.IGNORECASE)
+    _WINDOWS_FAILED_RE = re.compile(r"Test Complete - FAILED\s*\(windows", re.IGNORECASE)
+    _FILE_SIZE_GB_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kmgt]i?b?)?$", re.IGNORECASE)
+
+    @staticmethod
+    def _parse_file_size_to_gb(file_size: str) -> float:
+        """Parse sizes like '1G' / '1Gi' / '1024M' into a GB float for capacity math."""
+        match = OadpVmOperationsMixin._FILE_SIZE_GB_RE.match(str(file_size).strip())
+        if not match:
+            raise ValueError(f"Unsupported datafilesize value: {file_size!r}")
+        amount = float(match.group(1))
+        unit = (match.group(2) or "G").upper()
+        # Treat G/Gi/GB the same for the Windows validation contract (1G → 1GB).
+        multipliers = {
+            "B": 1 / (1024**3),
+            "K": 1 / (1024**2),
+            "KB": 1 / (1024**2),
+            "KI": 1 / (1024**2),
+            "KIB": 1 / (1024**2),
+            "M": 1 / 1024,
+            "MB": 1 / 1024,
+            "MI": 1 / 1024,
+            "MIB": 1 / 1024,
+            "G": 1,
+            "GB": 1,
+            "GI": 1,
+            "GIB": 1,
+            "T": 1024,
+            "TB": 1024,
+            "TI": 1024,
+            "TIB": 1024,
+        }
+        if unit not in multipliers:
+            raise ValueError(f"Unsupported datafilesize unit in {file_size!r}")
+        return amount * multipliers[unit]
+
+    @staticmethod
+    def _windows_expected_capacity_gb(
+        data_disks: int,
+        dir_count: int = WINDOWS_DEFAULT_DIR_COUNT,
+        files_per_dir: int = WINDOWS_DEFAULT_FILES_PER_DIR,
+        file_size: str = WINDOWS_DEFAULT_FILE_SIZE,
+    ) -> tuple[int | None, int]:
+        """Return (expectedExtraDiskCapacityGB|None, expectedTotalDiskUtilGB).
+
+        ``data_disks == 1``: only D: (48GB) — no expectedExtraDiskCapacityGB.
+        ``data_disks > 1``: extra = (data_disks-1)*dirCount*filesPerDir*fileSizeGB;
+        total = 48 + extra.
+        """
+        if data_disks < 1:
+            raise ValueError(f"data_disks must be >= 1 for Windows, got {data_disks}")
+        if data_disks == 1:
+            return None, WINDOWS_D_DRIVE_DATA_GB
+        file_size_gb = OadpVmOperationsMixin._parse_file_size_to_gb(file_size)
+        extra = int(round((data_disks - 1) * dir_count * files_per_dir * file_size_gb))
+        total = WINDOWS_D_DRIVE_DATA_GB + extra
+        return extra, total
+
+    @staticmethod
+    def _build_windows_population_command(scenario: dict, test_namespace: str) -> str:
+        """Build the env-prefixed ``run-workloads.sh`` command for Windows population."""
+        script_args = scenario["args"].get("vm_population_script_args", {})
+        vms = int(script_args.get("vms", 1))
+        data_disks = int(script_args.get("data_disks", WINDOWS_DEFAULT_DATA_DISKS))
+        osdisksize = script_args.get("osdisksize", WINDOWS_DEFAULT_OS_DISK_SIZE)
+        datadisksize = script_args.get("datadisksize", WINDOWS_DEFAULT_DATA_DISK_SIZE)
+        windows_image_url = script_args["windowsImageUrl"]
+        dir_count = int(script_args.get("datadircount", WINDOWS_DEFAULT_DIR_COUNT))
+        files_per_dir = int(script_args.get("datafilesperdir", WINDOWS_DEFAULT_FILES_PER_DIR))
+        file_size = script_args.get("datafilesize", WINDOWS_DEFAULT_FILE_SIZE)
+
+        extra_gb, total_gb = OadpVmOperationsMixin._windows_expected_capacity_gb(
+            data_disks=data_disks,
+            dir_count=dir_count,
+            files_per_dir=files_per_dir,
+            file_size=file_size,
+        )
+
+        env_parts = [
+            f"windowsImageUrl='{windows_image_url}'",
+            f"testNamespace='{test_namespace}'",
+            f"rootStorage='{osdisksize}'",
+            f"diskSize='{datadisksize}'",
+            f"vmCount='{vms}'",
+            f"dataDisks='{data_disks}'",
+        ]
+        # Only override gen params when the scenario set them (script vars.yml has defaults).
+        if "datadircount" in script_args:
+            env_parts.append(f"dirCount='{dir_count}'")
+        if "datafilesperdir" in script_args:
+            env_parts.append(f"filesPerDir='{files_per_dir}'")
+        if "datafilesize" in script_args:
+            env_parts.append(f"fileSize='{file_size}'")
+        if extra_gb is not None:
+            env_parts.append(f"expectedExtraDiskCapacityGB='{extra_gb}'")
+        env_parts.append(f"expectedTotalDiskUtilGB='{total_gb}'")
+
+        env_prefix = " ".join(env_parts)
+        return (
+            f"cd {CNV_SCENARIOS_PATH} && {env_prefix} "
+            f"./run-workloads.sh {CNV_WINDOWS_WORKLOAD} --os windows"
+        )
+
+    @staticmethod
+    def _windows_population_succeeded(output: str) -> bool | None:
+        """Return True/False from stdout SUCCESS/FAILED markers; None if neither found."""
+        if OadpVmOperationsMixin._WINDOWS_FAILED_RE.search(output or ""):
+            return False
+        if OadpVmOperationsMixin._WINDOWS_SUCCESS_RE.search(output or ""):
+            return True
+        return None
+
+    def _create_windows_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
+        """Populate Windows VMs via cnv-scenarios ``run-workloads.sh``."""
+        test_namespace = scenario["args"].get("namespaces_to_backup") or ds.get("namespace", "")
+        if not test_namespace:
+            self.fail_test_run("Windows VM population requires namespaces_to_backup / dataset namespace")
+
+        cmd = self._build_windows_population_command(scenario, test_namespace)
+        script_args = scenario["args"].get("vm_population_script_args", {})
+        vms = int(script_args.get("vms", 1))
+        data_disks = int(script_args.get("data_disks", WINDOWS_DEFAULT_DATA_DISKS))
+
+        self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script_windows")
+        output = self._run_vm_script(
+            cmd,
+            f"run-workloads.sh {CNV_WINDOWS_WORKLOAD} --os windows "
+            f"(namespace={test_namespace}, vms={vms}, data_disks={data_disks})",
+        )
+        self.oadp_timer(action="stop", transaction_name="vm_dataset_creation_script_windows")
+
+        # Corroborate exit-code success with the script's explicit SUCCESS banner.
+        status = self._windows_population_succeeded(output)
+        if status is False:
+            self.fail_test_run(
+                f"Windows VM population reported FAILED in stdout for namespace {test_namespace}"
+            )
+        elif status is True:
+            logger.info(f"Windows VM population SUCCESS confirmed in stdout for {test_namespace}")
+        else:
+            logger.warning(
+                "Windows VM population finished with exit 0 but SUCCESS banner was not found in stdout; "
+                "relying on exit code alone"
+            )
 
     # ------------------------------------------------------------------
     # CBT (Changed Block Tracking) script integration

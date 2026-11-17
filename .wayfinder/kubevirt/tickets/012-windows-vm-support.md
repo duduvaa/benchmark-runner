@@ -1,8 +1,13 @@
 # Windows VM Support
 
 **Label:** `wayfinder:grilling`  
-**Status:** Open  
+**Status:** Open (native path; script path done in 031)  
 **Blocked by:** [Golden Image Lifecycle](002-golden-image-lifecycle.md), [Tier 1 Live Test](006-tier1-live-test.md)
+
+## Progress
+
+- **Script path:** Done — [031](031-windows-script-population.md) wires `os: windows` → `cnv-scenarios/run-workloads.sh`.
+- **Native path (this ticket):** Still open — EFI/TPM/`accessCredentials`, Windows validation subset, HammerDB completion detection.
 
 ## Question
 

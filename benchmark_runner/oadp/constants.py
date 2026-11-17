@@ -17,6 +17,11 @@ MPQE_PROMQL_QUERIES = "/tmp/mpqe-scale-scripts/oadp-helpers/templates/metrics/me
 
 MPQE_VM_SCRIPTS_PATH = "/tmp/mpqe-scale-scripts/oadp-helpers/Scripts"
 
+# cnv-scenarios repo — Windows VM population via run-workloads.sh (hammerdb-mssql).
+CNV_SCENARIOS_PATH = "/home/kni/git/cnv-scenarios"
+CNV_WINDOWS_WORKLOAD = "hammerdb-mssql"
+CNV_KUBE_BURNER_RESULTS_ROOT = "/tmp/kube-burner-results"
+
 # VMsPopulation.sh's multi-NS loop always appends "-ns<i>" to the namespace
 # base name, even when only one namespace is requested (-ns 1, the only
 # value benchmark-runner passes today). Script-based VM scenarios must set
@@ -157,6 +162,21 @@ VM_DEFAULT_SSH_USER = "cloud-user"
 VM_POPULATION_METHOD_NATIVE = "native"
 VM_POPULATION_METHOD_SCRIPT = "script"
 KNOWN_VM_POPULATION_METHODS = frozenset({VM_POPULATION_METHOD_NATIVE, VM_POPULATION_METHOD_SCRIPT})
+
+# Script population OS discriminator (vm_population_script_args.os). Absent → rhel.
+VM_POPULATION_OS_RHEL = "rhel"
+VM_POPULATION_OS_WINDOWS = "windows"
+KNOWN_VM_POPULATION_OS = frozenset({VM_POPULATION_OS_RHEL, VM_POPULATION_OS_WINDOWS})
+
+# Windows (cnv-scenarios hammerdb-mssql) defaults when omitted from script args
+WINDOWS_DEFAULT_DATA_DISKS = 1
+WINDOWS_DEFAULT_OS_DISK_SIZE = "80Gi"
+WINDOWS_DEFAULT_DATA_DISK_SIZE = "150Gi"
+WINDOWS_DEFAULT_DIR_COUNT = 5
+WINDOWS_DEFAULT_FILES_PER_DIR = 10
+WINDOWS_DEFAULT_FILE_SIZE = "1G"
+# Fixed D: drive generated data size used by the Windows script validation contract
+WINDOWS_D_DRIVE_DATA_GB = 48
 
 # VMsAddDataVerify.sh increment levels (see ticket 022)
 KNOWN_INCREMENT_LEVELS = frozenset({"inc1", "inc2", "inc3"})

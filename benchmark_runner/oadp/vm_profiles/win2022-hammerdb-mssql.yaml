@@ -1,0 +1,32 @@
+name: win2022-hammerdb-mssql
+os:
+  type: windows
+  distribution: win2022
+  # Actual image URL comes from vm_population_script_args.windowsImageUrl for script population.
+  image_source: http://f01-h08-000-1029u.rdu2.scalelab.redhat.com:9002/winmssql2022.qcow2
+  pull_method: http
+resources:
+  cpu_cores: 8
+  memory: 16Gi
+disks:
+  - name: rootdisk
+    size: 80Gi
+    boot_order: 1
+  - name: datadisk
+    size: 150Gi
+    filesystem: ntfs
+    mount_point: D
+    source: blank
+    expected_capacity: "48G"
+    validation_path: D
+network:
+  interfaces:
+    - name: default
+      model: virtio
+      type: masquerade
+access:
+  method: accessCredentials
+data_generation:
+  method: hammerdb
+  config:
+    database: mssql
