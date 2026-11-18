@@ -44,16 +44,16 @@ def scenario_includes_kubevirt_dataset(scenario: dict) -> bool:
 def get_script_ns_count(scenario: dict) -> int:
     """Return 'vm_population_script_args.ns' (ticket 029), default 1.
 
-    'ns' > 1 means VMsPopulation.sh populates 'ns' sibling namespaces with the
-    same VM/disk/CBT configuration instead of just one. Windows script
-    population does not support multi-NS yet — always returns 1.
+    'ns' > 1 means the scenario spans 'ns' sibling namespaces
+    ('<base>-ns1'..'<base>-nsN') with the same VM/disk/CBT configuration.
+    RHEL creates them in one ``VMsPopulation.sh -ns N`` call; Windows runs
+    ``run-workloads.sh`` once per sibling (same command, only testNamespace
+    changes). Applies to both ``os: rhel`` and ``os: windows``.
     """
     args = scenario.get("args", {})
     if args.get("vm_population_method") != VM_POPULATION_METHOD_SCRIPT:
         return 1
     script_args = args.get("vm_population_script_args", {})
-    if script_args.get("os", VM_POPULATION_OS_RHEL) == VM_POPULATION_OS_WINDOWS:
-        return 1
     return int(script_args.get("ns", 1))
 
 
@@ -310,11 +310,8 @@ class OadpScenarioMixin:
             return False
 
         if os_name == VM_POPULATION_OS_WINDOWS:
-            # cbt: true is supported for Windows via post-population VMsEnableCBT.sh
-            # (cnv-scenarios is left unchanged — shared with other teams).
-            if ns != 1:
-                logger.error("Error: vm_population_script_args.ns > 1 is not supported for os: windows yet.")
-                return False
+            # cbt: true → post-population VMsEnableCBT.sh (cnv-scenarios unchanged).
+            # ns > 1 → N× run-workloads.sh with only testNamespace changed.
             windows_image_url = script_args.get("windowsImageUrl")
             if not isinstance(windows_image_url, str) or not windows_image_url.strip():
                 logger.error("Error: vm_population_script_args.windowsImageUrl is required when os: windows.")

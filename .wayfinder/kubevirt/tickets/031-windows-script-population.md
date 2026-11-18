@@ -18,8 +18,9 @@ Resolve: Windows scenarios map `tests.yaml` args to script env vars, compute exp
 - Mapping: `windowsImageUrl`, `namespaces_to_backup`→`testNamespace`, `osdisksize`→`rootStorage`, `datadisksize`→`diskSize`, `vms`→`vmCount`, `data_disks`→`dataDisks`, optional gen params → `dirCount`/`filesPerDir`/`fileSize`
 - Defaults: `data_disks=1`, `osdisksize=80Gi`, `datadisksize=150Gi`, gen `5/10/1G`
 - Capacity: `data_disks==1` → `expectedTotalDiskUtilGB=48`; `>1` → extra=`(n-1)*dir*files*sizeGB`, total=`48+extra`
-- `ns>1` / `increment_level` rejected for Windows in v1
-- **CBT (option A):** `cbt: true` allowed for Windows. After successful `run-workloads.sh`, call `VMsEnableCBT.sh -ns <namespaces_to_backup>`, wait for VMIs Running, then `VMsCBTstate.sh` and require state+label enabled for every VM. Does **not** modify cnv-scenarios (shared repo). Flow2 backup resource-policy applies via existing `cbt: true` wiring; restore stays without resource policy.
+- **`ns` > 1:** supported. Same convention as RHEL (`namespaces_to_backup: <base>-ns1` + `ns: N`). Because `run-workloads.sh` takes one `testNamespace`, framework runs the **same** command once per sibling with only the namespace name changed (cnv-scenarios unchanged). Example TC 13.0.4: `ns: 3` → `perf-win2022-1vm-1os-1data-rbd-ns1`/`-ns2`/`-ns3`.
+- **CBT (option A):** `cbt: true` allowed for Windows. After each successful `run-workloads.sh`, call `VMsEnableCBT.sh -ns <that sibling>`, wait for VMIs Running, then `VMsCBTstate.sh` and require state+label enabled. Flow2 backup resource-policy applies via existing `cbt: true` wiring; restore stays without resource policy.
+- `increment_level` still rejected for Windows.
 - Profile stub: `win2022-hammerdb-mssql.yaml` (script owns the real image URL)
 
 ### tests.yaml scenario to add in mpqe-scale-scripts

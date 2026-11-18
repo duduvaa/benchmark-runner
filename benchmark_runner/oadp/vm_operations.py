@@ -201,12 +201,15 @@ class OadpVmOperationsMixin:
         - ``windows`` → ``cnv-scenarios/run-workloads.sh hammerdb-mssql --os windows``
 
         Multi-namespace groups (``vm_population_script_args.ns`` > 1, ticket
-        029, RHEL only): a single ``VMsPopulation.sh -ns N`` invocation creates
-        every sibling namespace ('<base>-ns1'..'<base>-nsN') at once — there is
-        no way to ask the script to create just one sibling on its own. So this
-        method only actually runs the RHEL script when ``ds`` is the group's
-        '-ns1' member (the "leader"); non-leader calls are no-ops beyond
-        recording their own CBT state.
+        029):
+
+        - **RHEL:** a single ``VMsPopulation.sh -ns N`` invocation creates every
+          sibling ('<base>-ns1'..'<base>-nsN') at once. Only the group's '-ns1'
+          member (the "leader") runs the script; non-leader calls are no-ops
+          beyond recording their own CBT state.
+        - **Windows:** ``run-workloads.sh`` takes one ``testNamespace`` per
+          invocation, so each sibling is populated with the **same** command
+          and only the namespace name changed (cnv-scenarios unchanged).
         """
         script_args = scenario["args"].get("vm_population_script_args", {})
         os_name = script_args.get("os", VM_POPULATION_OS_RHEL)
@@ -371,14 +374,15 @@ class OadpVmOperationsMixin:
     def _create_windows_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
         """Populate Windows VMs via cnv-scenarios ``run-workloads.sh``.
 
-        When ``vm_population_script_args.cbt`` is true, after a successful
-        population run ``VMsEnableCBT.sh`` on the namespace, wait for all VMIs
-        to be Running, then verify CBT state/label via ``VMsCBTstate.sh``.
-        CBT is not done inside cnv-scenarios (shared repo) — option A.
+        Uses ``ds["namespace"]`` as ``testNamespace`` so multi-NS scenarios
+        (``ns`` > 1) run the **same** command once per sibling with only the
+        namespace name changed. When ``cbt`` is true, after a successful
+        population run ``VMsEnableCBT.sh`` on that namespace, wait for VMIs
+        Running, then verify via ``VMsCBTstate.sh`` (cnv-scenarios unchanged).
         """
-        test_namespace = scenario["args"].get("namespaces_to_backup") or ds.get("namespace", "")
+        test_namespace = ds.get("namespace") or scenario["args"].get("namespaces_to_backup", "")
         if not test_namespace:
-            self.fail_test_run("Windows VM population requires namespaces_to_backup / dataset namespace")
+            self.fail_test_run("Windows VM population requires dataset namespace / namespaces_to_backup")
 
         cmd = self._build_windows_population_command(scenario, test_namespace)
         script_args = scenario["args"].get("vm_population_script_args", {})

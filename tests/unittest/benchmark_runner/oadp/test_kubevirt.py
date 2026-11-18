@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -2359,9 +2359,14 @@ class TestWindowsVmPopulationValidation:
         s["args"]["vm_population_script_args"]["cbt"] = True
         assert mx.validate_scenario(s) is True
 
-    def test_windows_rejects_ns_greater_than_one(self, mx):
+    def test_windows_allows_ns_greater_than_one(self, mx):
         s = _windows_script_scenario()
-        s["args"]["vm_population_script_args"]["ns"] = 2
+        s["args"]["vm_population_script_args"]["ns"] = 3
+        assert mx.validate_scenario(s) is True
+
+    def test_windows_rejects_non_positive_ns(self, mx):
+        s = _windows_script_scenario()
+        s["args"]["vm_population_script_args"]["ns"] = 0
         assert mx.validate_scenario(s) is False
 
     def test_windows_allows_omitting_data_disks(self, mx):
@@ -2374,10 +2379,10 @@ class TestWindowsVmPopulationValidation:
         s["args"]["vm_population_script_args"]["data_disks"] = 0
         assert mx.validate_scenario(s) is False
 
-    def test_windows_get_script_ns_count_always_one(self):
+    def test_windows_get_script_ns_count_honors_ns(self):
         s = _windows_script_scenario()
-        s["args"]["vm_population_script_args"]["ns"] = 5  # invalid for validate, but helper must ignore
-        assert get_script_ns_count(s) == 1
+        s["args"]["vm_population_script_args"]["ns"] = 3
+        assert get_script_ns_count(s) == 3
 
     def test_windows_increment_level_rejected(self, mx):
         s = _windows_script_scenario()
@@ -2557,6 +2562,115 @@ class TestCreateWindowsVmDatasetViaScript:
             mx.create_vm_dataset_via_script(
                 scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
             )
+
+    def test_uses_ds_namespace_not_always_namespaces_to_backup(self, mx):
+        """Multi-NS recreate must populate the failing sibling, not always -ns1."""
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns2"}
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns2'" in cmd
+        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'" not in cmd
+
+    def test_multi_ns_same_command_only_namespace_changes(self, mx):
+        """TC 13.0.4: three siblings → identical cmds except testNamespace."""
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+        namespaces = [
+            "perf-win2022-1vm-1os-1data-rbd-ns1",
+            "perf-win2022-1vm-1os-1data-rbd-ns2",
+            "perf-win2022-1vm-1os-1data-rbd-ns3",
+        ]
+        cmds = []
+        for ns in namespaces:
+            mx.create_vm_dataset_via_script(scenario, {"namespace": ns})
+            cmds.append(mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"])
+
+        def without_namespace(cmd: str) -> str:
+            return cmd.replace("testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'", "NS").replace(
+                "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns2'", "NS"
+            ).replace(
+                "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns3'", "NS"
+            )
+
+        assert without_namespace(cmds[0]) == without_namespace(cmds[1]) == without_namespace(cmds[2])
+        for ns, cmd in zip(namespaces, cmds):
+            assert f"testNamespace='{ns}'" in cmd
+
+    def test_multi_ns_cbt_enables_per_sibling(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.enable_cbt_on_vms = MagicMock()
+        mx._wait_for_all_vms_running = MagicMock(return_value=True)
+        mx.check_cbt_state = MagicMock(
+            side_effect=lambda ns: {f"win-in-{ns}": {"state": "Enabled", "label": "true"}}
+        )
+        siblings = (
+            "perf-win2022-1vm-1os-1data-rbd-ns1",
+            "perf-win2022-1vm-1os-1data-rbd-ns2",
+            "perf-win2022-1vm-1os-1data-rbd-ns3",
+        )
+        for ns in siblings:
+            mx.create_vm_dataset_via_script(scenario, {"namespace": ns})
+        assert mx.enable_cbt_on_vms.call_args_list == [call(ns) for ns in siblings]
+
+
+class TestWindowsMultiNsExpansion:
+    """TC 13.0.4 shape: ns:3 expands siblings for dataset load / backup include list."""
+
+    def _tc_13_0_4(self):
+        s = _windows_script_scenario()
+        s["testcase"] = "13.0.4"
+        s["dataset"]["pv_size"] = "80Gi"
+        s["dataset"]["vms_per_namespace"] = 1
+        s["args"]["vm_population_script_args"]["data_disks"] = 1
+        s["args"]["vm_population_script_args"]["cbt"] = True
+        s["args"]["vm_population_script_args"]["ns"] = 3
+        return s
+
+    def test_scenario_backup_namespaces_expands_three(self):
+        s = self._tc_13_0_4()
+        assert scenario_backup_namespaces(s) == [
+            "perf-win2022-1vm-1os-1data-rbd-ns1",
+            "perf-win2022-1vm-1os-1data-rbd-ns2",
+            "perf-win2022-1vm-1os-1data-rbd-ns3",
+        ]
+
+    def test_load_datasets_creates_three_summaries(self):
+        mx = TestableScenario()
+        mx.print_all_ds = MagicMock()
+        mx.load_datasets_for_scenario(self._tc_13_0_4())
+        assert mx.ds_get_all_namespaces() == [
+            "perf-win2022-1vm-1os-1data-rbd-ns1",
+            "perf-win2022-1vm-1os-1data-rbd-ns2",
+            "perf-win2022-1vm-1os-1data-rbd-ns3",
+        ]
+
+    def test_backup_include_namespaces_covers_all_siblings(self):
+        mx = TestableExecution()
+        mx._OadpWorkloads__test_env["source"] = "downstream"
+        mx.exec_backup = MagicMock()
+        mx.wait_for_condition_of_cr = MagicMock(return_value=True)
+        mx.ds_get_all_namespaces = MagicMock(
+            return_value=[
+                "perf-win2022-1vm-1os-1data-rbd-ns1",
+                "perf-win2022-1vm-1os-1data-rbd-ns2",
+                "perf-win2022-1vm-1os-1data-rbd-ns3",
+            ]
+        )
+        scenario = self._tc_13_0_4()
+        mx.oadp_execute_scenario(scenario, run_method="python")
+        call_kwargs = mx.exec_backup.call_args.kwargs
+        assert call_kwargs["namespaces_to_backup"] == (
+            "perf-win2022-1vm-1os-1data-rbd-ns1,"
+            "perf-win2022-1vm-1os-1data-rbd-ns2,"
+            "perf-win2022-1vm-1os-1data-rbd-ns3"
+        )
+        assert call_kwargs["resource_policy_configmap"] == KUBEVIRT_VOLUME_POLICY_CONFIGMAP_NAME
 
 
 class TestCbtEntryIsEnabled:
