@@ -2354,10 +2354,10 @@ class TestWindowsVmPopulationValidation:
         del s["args"]["vm_population_script_args"]["windowsImageUrl"]
         assert mx.validate_scenario(s) is False
 
-    def test_windows_rejects_cbt(self, mx):
+    def test_windows_allows_cbt_true(self, mx):
         s = _windows_script_scenario()
         s["args"]["vm_population_script_args"]["cbt"] = True
-        assert mx.validate_scenario(s) is False
+        assert mx.validate_scenario(s) is True
 
     def test_windows_rejects_ns_greater_than_one(self, mx):
         s = _windows_script_scenario()
@@ -2505,6 +2505,69 @@ class TestCreateWindowsVmDatasetViaScript:
                 _windows_script_scenario(),
                 {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"},
             )
+
+    def test_cbt_false_skips_enable(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx.enable_cbt_on_vms = MagicMock()
+        mx.check_cbt_state = MagicMock()
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+        )
+        mx.enable_cbt_on_vms.assert_not_called()
+        mx.check_cbt_state.assert_not_called()
+
+    def test_cbt_true_enables_waits_and_verifies(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.enable_cbt_on_vms = MagicMock()
+        mx._wait_for_all_vms_running = MagicMock(return_value=True)
+        mx.check_cbt_state = MagicMock(
+            return_value={"win-vm-0": {"state": "Enabled", "label": "true"}}
+        )
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+        )
+        mx.enable_cbt_on_vms.assert_called_once_with("perf-win2022-1vm-1os-1data-rbd-ns1")
+        mx._wait_for_all_vms_running.assert_called_once()
+        mx.check_cbt_state.assert_called_once_with("perf-win2022-1vm-1os-1data-rbd-ns1")
+        assert mx._OadpWorkloads__run_metadata["summary"]["validations"]["cbt_state"][
+            "perf-win2022-1vm-1os-1data-rbd-ns1"
+        ] == {"win-vm-0": {"state": "Enabled", "label": "true"}}
+
+    def test_cbt_true_fails_when_label_not_set(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.enable_cbt_on_vms = MagicMock()
+        mx._wait_for_all_vms_running = MagicMock(return_value=True)
+        mx.check_cbt_state = MagicMock(
+            return_value={"win-vm-0": {"state": "Enabled", "label": "false"}}
+        )
+        with pytest.raises(RuntimeError, match="CBT not enabled"):
+            mx.create_vm_dataset_via_script(
+                scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+            )
+
+    def test_cbt_true_fails_when_vms_not_running_after_enable(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["cbt"] = True
+        mx.enable_cbt_on_vms = MagicMock()
+        mx._wait_for_all_vms_running = MagicMock(return_value=False)
+        with pytest.raises(RuntimeError, match="not all .* VMIs Running"):
+            mx.create_vm_dataset_via_script(
+                scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+            )
+
+
+class TestCbtEntryIsEnabled:
+    def test_enabled_true_label(self):
+        assert OadpVmOperationsMixin._cbt_entry_is_enabled({"state": "Enabled", "label": "true"})
+
+    def test_false_label_rejected(self):
+        assert not OadpVmOperationsMixin._cbt_entry_is_enabled({"state": "Enabled", "label": "false"})
+
+    def test_empty_state_rejected(self):
+        assert not OadpVmOperationsMixin._cbt_entry_is_enabled({"state": "", "label": "true"})
 
 
 class TestWindowsProfileLoader:

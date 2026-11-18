@@ -310,9 +310,8 @@ class OadpScenarioMixin:
             return False
 
         if os_name == VM_POPULATION_OS_WINDOWS:
-            if cbt:
-                logger.error("Error: vm_population_script_args.cbt is not supported for os: windows yet.")
-                return False
+            # cbt: true is supported for Windows via post-population VMsEnableCBT.sh
+            # (cnv-scenarios is left unchanged — shared with other teams).
             if ns != 1:
                 logger.error("Error: vm_population_script_args.ns > 1 is not supported for os: windows yet.")
                 return False

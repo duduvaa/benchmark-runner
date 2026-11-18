@@ -369,7 +369,13 @@ class OadpVmOperationsMixin:
         return None
 
     def _create_windows_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
-        """Populate Windows VMs via cnv-scenarios ``run-workloads.sh``."""
+        """Populate Windows VMs via cnv-scenarios ``run-workloads.sh``.
+
+        When ``vm_population_script_args.cbt`` is true, after a successful
+        population run ``VMsEnableCBT.sh`` on the namespace, wait for all VMIs
+        to be Running, then verify CBT state/label via ``VMsCBTstate.sh``.
+        CBT is not done inside cnv-scenarios (shared repo) — option A.
+        """
         test_namespace = scenario["args"].get("namespaces_to_backup") or ds.get("namespace", "")
         if not test_namespace:
             self.fail_test_run("Windows VM population requires namespaces_to_backup / dataset namespace")
@@ -378,6 +384,7 @@ class OadpVmOperationsMixin:
         script_args = scenario["args"].get("vm_population_script_args", {})
         vms = int(script_args.get("vms", 1))
         data_disks = int(script_args.get("data_disks", WINDOWS_DEFAULT_DATA_DISKS))
+        cbt = bool(script_args.get("cbt", False))
 
         self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script_windows")
         output = self._run_vm_script(
@@ -400,6 +407,62 @@ class OadpVmOperationsMixin:
                 "Windows VM population finished with exit 0 but SUCCESS banner was not found in stdout; "
                 "relying on exit code alone"
             )
+
+        if cbt:
+            self._enable_and_verify_windows_cbt(scenario, test_namespace, expected_vms=vms)
+
+    def _enable_and_verify_windows_cbt(self, scenario: dict, namespace: str, expected_vms: int) -> None:
+        """Enable CBT on Windows VMs and verify state/label for every VM."""
+        self.oadp_timer(action="start", transaction_name="vm_windows_cbt_enable")
+        self.enable_cbt_on_vms(namespace)
+        self.oadp_timer(action="stop", transaction_name="vm_windows_cbt_enable")
+
+        if not self._wait_for_all_vms_running(namespace, expected_vms, scenario):
+            self.fail_test_run(
+                f"Windows CBT enable: not all {expected_vms} VMIs Running in {namespace} after VMsEnableCBT.sh"
+            )
+
+        cbt_state = self.check_cbt_state(namespace)
+        self._assert_cbt_enabled_for_all_vms(namespace, cbt_state, expected_vms)
+        self._record_cbt_state(namespace, cbt_state)
+
+    @staticmethod
+    def _cbt_entry_is_enabled(entry: dict) -> bool:
+        """Return True when CBT state and label both indicate enabled."""
+        state = str(entry.get("state", "")).strip().lower()
+        label = str(entry.get("label", "")).strip().lower()
+        state_ok = state in {"enabled", "true", "1"} or "enabled" in state
+        label_ok = label in {"true", "1", "yes"}
+        return state_ok and label_ok
+
+    def _assert_cbt_enabled_for_all_vms(
+        self,
+        namespace: str,
+        cbt_state: dict,
+        expected_vms: int,
+    ) -> None:
+        """Fail the run unless every reported VM has CBT state+label enabled."""
+        if not cbt_state:
+            self.fail_test_run(
+                f"Windows CBT verify: VMsCBTstate.sh returned no VMs for namespace {namespace}"
+            )
+        if expected_vms > 0 and len(cbt_state) < expected_vms:
+            self.fail_test_run(
+                f"Windows CBT verify: expected at least {expected_vms} VMs in {namespace}, "
+                f"got {len(cbt_state)}: {sorted(cbt_state)}"
+            )
+        failing = {
+            vm: info
+            for vm, info in cbt_state.items()
+            if not self._cbt_entry_is_enabled(info)
+        }
+        if failing:
+            self.fail_test_run(
+                f"Windows CBT verify: CBT not enabled for VMs in {namespace}: {failing}"
+            )
+        logger.info(
+            f"Windows CBT verify: all {len(cbt_state)} VMs in {namespace} have CBT state+label enabled"
+        )
 
     # ------------------------------------------------------------------
     # CBT (Changed Block Tracking) script integration

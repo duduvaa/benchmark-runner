@@ -1,0 +1,29 @@
+# Copy into mpqe-scale-scripts oadp-helpers/templates/internal_data/tests.yaml (Windows CBT).
+# After population, benchmark-runner runs VMsEnableCBT.sh then VMsCBTstate.sh (option A).
+# Flow2 backup gets --resource-policies-configmap; restore does not.
+- name: backup-dm-win2022-1vm-1os-1data-cbt-cephrbd
+  testcase: 13.1
+  testtype: backup
+  dataset:
+    role: kubevirt
+    vm_profile: win2022-hammerdb-mssql
+    vms_per_namespace: 1
+    sc: ocs-storagecluster-ceph-rbd
+    pv_size: 60Gi
+  args:
+    plugin: kubevirt
+    use_cli: true
+    OADP_CR_TYPE: backup
+    OADP_CR_NAME: backup-dm-win2022-1vm-1os-1data-cbt-cephrbd
+    backup_name: backup-dm-win2022-1vm-1os-1data-cbt-cephrbd
+    testcase_timeout: 79200
+    namespaces_to_backup: perf-win2022-1vm-1os-1data-cbt-rbd-ns1
+    vm_population_method: script
+    vm_population_script_args:
+      os: windows
+      windowsImageUrl: http://f01-h08-000-1029u.rdu2.scalelab.redhat.com:9002/winmssql2022.qcow2
+      osdisksize: 80Gi
+      datadisksize: 150Gi
+      vms: 1
+      data_disks: 1
+      cbt: true

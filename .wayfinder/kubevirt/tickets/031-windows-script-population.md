@@ -18,7 +18,8 @@ Resolve: Windows scenarios map `tests.yaml` args to script env vars, compute exp
 - Mapping: `windowsImageUrl`, `namespaces_to_backup`→`testNamespace`, `osdisksize`→`rootStorage`, `datadisksize`→`diskSize`, `vms`→`vmCount`, `data_disks`→`dataDisks`, optional gen params → `dirCount`/`filesPerDir`/`fileSize`
 - Defaults: `data_disks=1`, `osdisksize=80Gi`, `datadisksize=150Gi`, gen `5/10/1G`
 - Capacity: `data_disks==1` → `expectedTotalDiskUtilGB=48`; `>1` → extra=`(n-1)*dir*files*sizeGB`, total=`48+extra`
-- CBT / `ns>1` / `increment_level` rejected for Windows in v1
+- `ns>1` / `increment_level` rejected for Windows in v1
+- **CBT (option A):** `cbt: true` allowed for Windows. After successful `run-workloads.sh`, call `VMsEnableCBT.sh -ns <namespaces_to_backup>`, wait for VMIs Running, then `VMsCBTstate.sh` and require state+label enabled for every VM. Does **not** modify cnv-scenarios (shared repo). Flow2 backup resource-policy applies via existing `cbt: true` wiring; restore stays without resource policy.
 - Profile stub: `win2022-hammerdb-mssql.yaml` (script owns the real image URL)
 
 ### tests.yaml scenario to add in mpqe-scale-scripts
