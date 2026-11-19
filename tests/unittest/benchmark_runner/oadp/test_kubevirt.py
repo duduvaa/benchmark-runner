@@ -2582,44 +2582,42 @@ class TestCreateWindowsVmDatasetViaScript:
                 scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
             )
 
-    def test_uses_ds_namespace_not_always_namespaces_to_backup(self, mx):
-        """Multi-NS recreate must populate the failing sibling, not always -ns1."""
-        scenario = _windows_script_scenario()
-        scenario["args"]["vm_population_script_args"]["ns"] = 3
-        mx.create_vm_dataset_via_script(
-            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns2"}
-        )
-        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
-        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns2'" in cmd
-        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'" not in cmd
-
-    def test_multi_ns_same_command_only_namespace_changes(self, mx):
-        """TC 13.0.4: three siblings → identical cmds except testNamespace."""
+    def test_multi_ns_leader_populates_all_siblings_same_command(self, mx):
+        """Leader (-ns1) with ns:3 runs run-workloads three times; only testNamespace changes."""
         scenario = _windows_script_scenario()
         scenario["args"]["vm_population_script_args"]["ns"] = 3
         scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+        )
+        cmds = [c.kwargs["cmd"] for c in mx._OadpWorkloads__ssh.run.call_args_list]
         namespaces = [
             "perf-win2022-1vm-1os-1data-rbd-ns1",
             "perf-win2022-1vm-1os-1data-rbd-ns2",
             "perf-win2022-1vm-1os-1data-rbd-ns3",
         ]
-        cmds = []
-        for ns in namespaces:
-            mx.create_vm_dataset_via_script(scenario, {"namespace": ns})
-            cmds.append(mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"])
+        assert len(cmds) == 3
 
         def without_namespace(cmd: str) -> str:
-            return cmd.replace("testNamespace='perf-win2022-1vm-1os-1data-rbd-ns1'", "NS").replace(
-                "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns2'", "NS"
-            ).replace(
-                "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns3'", "NS"
-            )
+            out = cmd
+            for ns in namespaces:
+                out = out.replace(f"testNamespace='{ns}'", "NS")
+            return out
 
         assert without_namespace(cmds[0]) == without_namespace(cmds[1]) == without_namespace(cmds[2])
         for ns, cmd in zip(namespaces, cmds):
             assert f"testNamespace='{ns}'" in cmd
 
-    def test_multi_ns_cbt_enables_per_sibling(self, mx):
+    def test_multi_ns_sibling_skips_population(self, mx):
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns2"}
+        )
+        mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_multi_ns_leader_cbt_enables_each_sibling(self, mx):
         scenario = _windows_script_scenario()
         scenario["args"]["vm_population_script_args"]["ns"] = 3
         scenario["args"]["vm_population_script_args"]["cbt"] = True
@@ -2633,9 +2631,26 @@ class TestCreateWindowsVmDatasetViaScript:
             "perf-win2022-1vm-1os-1data-rbd-ns2",
             "perf-win2022-1vm-1os-1data-rbd-ns3",
         )
-        for ns in siblings:
-            mx.create_vm_dataset_via_script(scenario, {"namespace": ns})
+        mx.create_vm_dataset_via_script(scenario, {"namespace": siblings[0]})
         assert mx.enable_cbt_on_vms.call_args_list == [call(ns) for ns in siblings]
+
+    def test_multi_ns_recreate_leader_only_still_creates_all_three(self, mx):
+        """Even if recreate only queues -ns1, leader loop creates ns1/ns2/ns3."""
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns1"}
+        )
+        namespaces = {
+            c.kwargs["cmd"].split("testNamespace='")[1].split("'")[0]
+            for c in mx._OadpWorkloads__ssh.run.call_args_list
+        }
+        assert namespaces == {
+            "perf-win2022-1vm-1os-1data-rbd-ns1",
+            "perf-win2022-1vm-1os-1data-rbd-ns2",
+            "perf-win2022-1vm-1os-1data-rbd-ns3",
+        }
 
 
 class TestWindowsMultiNsExpansion:

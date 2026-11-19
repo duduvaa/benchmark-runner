@@ -82,6 +82,9 @@ class OadpVmValidationMixin:
     def validate_expected_vm_datasets(self, scenario: dict) -> bool:
         """Validate all VM datasets for the scenario.  Returns True if all pass."""
         try:
+            # Reset so recreate loops see only failures from this validation pass.
+            self._OadpWorkloads__oadp_ds_failing_validation = []
+
             dataset_value = scenario.get("dataset")
             if isinstance(dataset_value, list):
                 datasets = [d for d in dataset_value if d.get("role") == VM_DATASET_ROLE]

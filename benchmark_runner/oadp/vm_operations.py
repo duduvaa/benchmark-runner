@@ -39,6 +39,7 @@ from benchmark_runner.oadp.constants import (
     WINDOWS_DEFAULT_FILES_PER_DIR,
     WINDOWS_DEFAULT_OS_DISK_SIZE,
 )
+from benchmark_runner.oadp.scenario import expand_multi_namespaces
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "vm_templates"
@@ -208,8 +209,9 @@ class OadpVmOperationsMixin:
           member (the "leader") runs the script; non-leader calls are no-ops
           beyond recording their own CBT state.
         - **Windows:** ``run-workloads.sh`` takes one ``testNamespace`` per
-          invocation, so each sibling is populated with the **same** command
-          and only the namespace name changed (cnv-scenarios unchanged).
+          invocation. The ``-ns1`` leader runs the **same** command once per
+          sibling (only the namespace name changes); non-leader calls skip
+          population (cnv-scenarios unchanged).
         """
         script_args = scenario["args"].get("vm_population_script_args", {})
         os_name = script_args.get("os", VM_POPULATION_OS_RHEL)
@@ -374,21 +376,65 @@ class OadpVmOperationsMixin:
     def _create_windows_vm_dataset_via_script(self, scenario: dict, ds: dict) -> None:
         """Populate Windows VMs via cnv-scenarios ``run-workloads.sh``.
 
-        Uses ``ds["namespace"]`` as ``testNamespace`` so multi-NS scenarios
-        (``ns`` > 1) run the **same** command once per sibling with only the
-        namespace name changed. When ``cbt`` is true, after a successful
-        population run ``VMsEnableCBT.sh`` on that namespace, wait for VMIs
-        Running, then verify via ``VMsCBTstate.sh`` (cnv-scenarios unchanged).
-        """
-        test_namespace = ds.get("namespace") or scenario["args"].get("namespaces_to_backup", "")
-        if not test_namespace:
-            self.fail_test_run("Windows VM population requires dataset namespace / namespaces_to_backup")
+        Multi-NS (``ns`` > 1): the ``-ns1`` leader runs the **same**
+        ``run-workloads.sh`` once per sibling with only ``testNamespace``
+        changed (cnv-scenarios is single-NS). Non-leader calls skip population
+        (mirrors RHEL leader/sibling) but still record CBT state when enabled.
 
-        cmd = self._build_windows_population_command(scenario, test_namespace)
+        When ``cbt`` is true, after each successful population run
+        ``VMsEnableCBT.sh``, wait for VMIs Running, then verify via
+        ``VMsCBTstate.sh``.
+        """
         script_args = scenario["args"].get("vm_population_script_args", {})
         vms = int(script_args.get("vms", 1))
         data_disks = int(script_args.get("data_disks", WINDOWS_DEFAULT_DATA_DISKS))
         cbt = bool(script_args.get("cbt", False))
+        ns_count = int(script_args.get("ns", 1))
+
+        namespace = ds.get("namespace") or scenario["args"].get("namespaces_to_backup", "")
+        if not namespace:
+            self.fail_test_run("Windows VM population requires dataset namespace / namespaces_to_backup")
+
+        is_group_leader = namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX)
+        if ns_count > 1 and not is_group_leader:
+            logger.info(
+                f"create_vm_dataset_via_script: {namespace} is a sibling in a {ns_count}-namespace "
+                f"Windows group already created by the '-ns1' member's run-workloads.sh loop "
+                f"— skipping a redundant script call."
+            )
+            if cbt:
+                cbt_state = self.check_cbt_state(namespace)
+                self._assert_cbt_enabled_for_all_vms(namespace, cbt_state, expected_vms=vms)
+                self._record_cbt_state(namespace, cbt_state)
+            return
+
+        namespaces = (
+            expand_multi_namespaces(namespace, ns_count) if ns_count > 1 else [namespace]
+        )
+        logger.info(
+            f"Windows VM population: ns_count={ns_count}, "
+            f"populating namespaces={namespaces} (same run-workloads.sh, only testNamespace changes)"
+        )
+        for test_namespace in namespaces:
+            self._populate_one_windows_namespace(
+                scenario,
+                test_namespace,
+                vms=vms,
+                data_disks=data_disks,
+                cbt=cbt,
+            )
+
+    def _populate_one_windows_namespace(
+        self,
+        scenario: dict,
+        test_namespace: str,
+        *,
+        vms: int,
+        data_disks: int,
+        cbt: bool,
+    ) -> None:
+        """Run run-workloads.sh (+ optional CBT) for a single Windows namespace."""
+        cmd = self._build_windows_population_command(scenario, test_namespace)
 
         self.oadp_timer(action="start", transaction_name="vm_dataset_creation_script_windows")
         output = self._run_vm_script(
@@ -398,7 +444,6 @@ class OadpVmOperationsMixin:
         )
         self.oadp_timer(action="stop", transaction_name="vm_dataset_creation_script_windows")
 
-        # Corroborate exit-code success with the script's explicit SUCCESS banner.
         status = self._windows_population_succeeded(output)
         if status is False:
             self.fail_test_run(
