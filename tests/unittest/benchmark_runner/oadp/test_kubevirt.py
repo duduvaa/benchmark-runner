@@ -2608,14 +2608,28 @@ class TestCreateWindowsVmDatasetViaScript:
         for ns, cmd in zip(namespaces, cmds):
             assert f"testNamespace='{ns}'" in cmd
 
-    def test_multi_ns_sibling_skips_population(self, mx):
+    def test_multi_ns_sibling_skips_when_already_populated(self, mx):
         scenario = _windows_script_scenario()
         scenario["args"]["vm_population_script_args"]["ns"] = 3
         scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx._windows_namespace_already_populated = MagicMock(return_value=True)
         mx.create_vm_dataset_via_script(
             scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns2"}
         )
         mx._OadpWorkloads__ssh.run.assert_not_called()
+
+    def test_multi_ns_sibling_populates_when_missing_after_partial_run(self, mx):
+        """If -ns1 already exists, recreate queues only -ns2/-ns3 — must still populate them."""
+        scenario = _windows_script_scenario()
+        scenario["args"]["vm_population_script_args"]["ns"] = 3
+        scenario["args"]["vm_population_script_args"]["cbt"] = False
+        mx._windows_namespace_already_populated = MagicMock(return_value=False)
+        mx.create_vm_dataset_via_script(
+            scenario, {"namespace": "perf-win2022-1vm-1os-1data-rbd-ns2"}
+        )
+        cmd = mx._OadpWorkloads__ssh.run.call_args.kwargs["cmd"]
+        assert "testNamespace='perf-win2022-1vm-1os-1data-rbd-ns2'" in cmd
+        assert mx._OadpWorkloads__ssh.run.call_count == 1
 
     def test_multi_ns_leader_cbt_enables_each_sibling(self, mx):
         scenario = _windows_script_scenario()

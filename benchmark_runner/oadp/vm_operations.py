@@ -378,12 +378,11 @@ class OadpVmOperationsMixin:
 
         Multi-NS (``ns`` > 1): the ``-ns1`` leader runs the **same**
         ``run-workloads.sh`` once per sibling with only ``testNamespace``
-        changed (cnv-scenarios is single-NS). Non-leader calls skip population
-        (mirrors RHEL leader/sibling) but still record CBT state when enabled.
-
-        When ``cbt`` is true, after each successful population run
-        ``VMsEnableCBT.sh``, wait for VMIs Running, then verify via
-        ``VMsCBTstate.sh``.
+        changed (cnv-scenarios is single-NS). Sibling calls skip only when
+        that namespace is already populated; otherwise they populate themselves
+        (covers partial runs where ``-ns1`` already existed so recreate never
+        re-queued the leader). CBT enable/verify still runs per populated NS
+        when ``cbt`` is true.
         """
         script_args = scenario["args"].get("vm_population_script_args", {})
         vms = int(script_args.get("vms", 1))
@@ -396,23 +395,30 @@ class OadpVmOperationsMixin:
             self.fail_test_run("Windows VM population requires dataset namespace / namespaces_to_backup")
 
         is_group_leader = namespace.endswith(MPQE_VM_SCRIPT_NS_SUFFIX)
-        if ns_count > 1 and not is_group_leader:
-            logger.info(
-                f"create_vm_dataset_via_script: {namespace} is a sibling in a {ns_count}-namespace "
-                f"Windows group already created by the '-ns1' member's run-workloads.sh loop "
-                f"— skipping a redundant script call."
-            )
-            if cbt:
-                cbt_state = self.check_cbt_state(namespace)
-                self._assert_cbt_enabled_for_all_vms(namespace, cbt_state, expected_vms=vms)
-                self._record_cbt_state(namespace, cbt_state)
-            return
+        if ns_count > 1 and is_group_leader:
+            # Leader creates every sibling in one go (same command, only testNamespace
+            # changes). Covers the common "nothing exists yet" recreate path.
+            namespaces = expand_multi_namespaces(namespace, ns_count)
+        elif ns_count > 1 and not is_group_leader:
+            # Sibling recreate: only skip when this NS is already populated.
+            # If -ns1 already existed from a prior partial run, failing=[ns2,ns3]
+            # and blind skip would leave siblings missing forever (non-CBT repro).
+            if self._windows_namespace_already_populated(namespace, expected_vms=vms):
+                logger.info(
+                    f"create_vm_dataset_via_script: Windows sibling {namespace} already has "
+                    f"{vms} VM(s) — skipping redundant run-workloads.sh"
+                )
+                if cbt:
+                    cbt_state = self.check_cbt_state(namespace)
+                    self._assert_cbt_enabled_for_all_vms(namespace, cbt_state, expected_vms=vms)
+                    self._record_cbt_state(namespace, cbt_state)
+                return
+            namespaces = [namespace]
+        else:
+            namespaces = [namespace]
 
-        namespaces = (
-            expand_multi_namespaces(namespace, ns_count) if ns_count > 1 else [namespace]
-        )
         logger.info(
-            f"Windows VM population: ns_count={ns_count}, "
+            f"Windows VM population: ns_count={ns_count}, leader={is_group_leader}, "
             f"populating namespaces={namespaces} (same run-workloads.sh, only testNamespace changes)"
         )
         for test_namespace in namespaces:
@@ -423,6 +429,15 @@ class OadpVmOperationsMixin:
                 data_disks=data_disks,
                 cbt=cbt,
             )
+
+    def _windows_namespace_already_populated(self, namespace: str, expected_vms: int) -> bool:
+        """Fast existence check (no patient retry) for Windows sibling skip decisions."""
+        result = self._oc.run(cmd=f"oc get vm -n {namespace} --no-headers 2>/dev/null | wc -l")
+        try:
+            count = int((result or "").strip())
+        except (ValueError, AttributeError):
+            count = 0
+        return count >= expected_vms
 
     def _populate_one_windows_namespace(
         self,
