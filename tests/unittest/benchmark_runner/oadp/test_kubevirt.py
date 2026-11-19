@@ -1461,6 +1461,25 @@ class TestValidateVmDatasetScriptDispatch:
         assert result is True
         mx.verify_vm_data_via_script.assert_not_called()
 
+    def test_windows_script_skips_vmsadddataverify(self, mx):
+        """VMsAddDataVerify.sh is RHEL-only; Windows relies on run-workloads SUCCESS."""
+        mx.get_dataset_validation_mode = lambda ds: "light"
+        mx._oc.run.side_effect = ["1", "1"]
+        mx.verify_vm_data_via_script = MagicMock(return_value=False)
+        scenario = _windows_script_scenario()
+        result = mx._validate_vm_dataset(
+            scenario,
+            {
+                "role": "kubevirt",
+                "vm_profile": "win2022-hammerdb-mssql",
+                "vms_per_namespace": 1,
+                "sc": "s",
+                "namespace": "perf-win2022-1vm-1os-1data-cbt-rbd-ns1",
+            },
+        )
+        assert result is True
+        mx.verify_vm_data_via_script.assert_not_called()
+
 
 # ===========================================================================
 # 23. CBT flag propagation from scenario args through to CBT enablement

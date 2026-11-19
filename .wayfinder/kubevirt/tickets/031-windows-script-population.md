@@ -21,6 +21,7 @@ Resolve: Windows scenarios map `tests.yaml` args to script env vars, compute exp
 - **`ns` > 1:** supported. Same convention as RHEL (`namespaces_to_backup: <base>-ns1` + `ns: N`). Because `run-workloads.sh` takes one `testNamespace`, framework runs the **same** command once per sibling with only the namespace name changed (cnv-scenarios unchanged). Example TC 13.0.4: `ns: 3` → `perf-win2022-1vm-1os-1data-rbd-ns1`/`-ns2`/`-ns3`.
 - **CBT (option A):** `cbt: true` allowed for Windows. After each successful `run-workloads.sh`, call `VMsEnableCBT.sh -ns <that sibling>`, wait for VMIs Running, then `VMsCBTstate.sh` and require state+label enabled. Flow2 backup resource-policy applies via existing `cbt: true` wiring; restore stays without resource policy.
 - `increment_level` still rejected for Windows.
+- **Data verify:** skip `VMsAddDataVerify.sh -verify-only` for Windows (RHEL SSH/`/home/data` baselines). Existence checks (VM count, VMI Running) still run; disk data is covered by `run-workloads.sh` SUCCESS at population time.
 - Profile stub: `win2022-hammerdb-mssql.yaml` (script owns the real image URL)
 
 ### tests.yaml scenario to add in mpqe-scale-scripts

@@ -23,6 +23,8 @@ from benchmark_runner.oadp.constants import (
     VM_DATASET_ROLE,
     VM_DEFAULT_SSH_USER,
     VM_POPULATION_METHOD_SCRIPT,
+    VM_POPULATION_OS_RHEL,
+    VM_POPULATION_OS_WINDOWS,
 )
 from benchmark_runner.oadp.scenario import expand_multi_namespaces, get_script_ns_count
 from benchmark_runner.oadp.vm_profiles import load_vm_profile, merge_disk_overrides
@@ -137,6 +139,19 @@ class OadpVmValidationMixin:
             return True
 
         if scenario.get("args", {}).get("vm_population_method") == VM_POPULATION_METHOD_SCRIPT:
+            script_os = (
+                scenario.get("args", {})
+                .get("vm_population_script_args", {})
+                .get("os", VM_POPULATION_OS_RHEL)
+            )
+            # VMsAddDataVerify.sh is RHEL-only (SSH + /home/data baselines).
+            # Windows data is validated by cnv-scenarios run-workloads.sh SUCCESS.
+            if script_os == VM_POPULATION_OS_WINDOWS:
+                logger.info(
+                    f"Skipping VMsAddDataVerify.sh for Windows namespace {namespace} "
+                    "(RHEL-only script; relying on run-workloads.sh SUCCESS + VM/VMI checks)"
+                )
+                return True
             return self.verify_vm_data_via_script(namespace)
 
         if validation_mode == VALIDATION_MODE_LIGHT:
